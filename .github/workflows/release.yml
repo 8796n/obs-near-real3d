@@ -18,7 +18,7 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Resolve version
         id: ver
@@ -30,9 +30,24 @@ jobs:
           Write-Host "version = $v"
 
       - name: Setup MSVC (cl / lib / dumpbin on PATH)
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
+        # Done in-line (vcvars -> $GITHUB_ENV) instead of a Node-based action so
+        # the workflow has no Node.js-20 dependency to break on Node 24.
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars)) { throw "vcvars64.bat not found at $vcvars" }
+          $before = @{}
+          foreach ($e in Get-ChildItem Env:) { $before[$e.Name] = $e.Value }
+          cmd /c "`"$vcvars`" >nul 2>&1 && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') {
+              $n = $Matches[1]; $v = $Matches[2]
+              if ($before[$n] -ne $v) { "$n=$v" | Out-File $env:GITHUB_ENV -Append -Encoding utf8 }
+            }
+          }
+          Write-Host "MSVC environment configured from $vcvars"
 
       - name: Install Ninja + OBS Studio
         run: |
@@ -99,14 +114,14 @@ jobs:
         run: ./package.ps1 -Version ${{ steps.ver.outputs.version }}
 
       - name: Upload artifacts (every run)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: near-real3d-${{ steps.ver.outputs.version }}
           path: dist/*
 
       - name: Publish release (tags only)
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: near Real 3D ${{ steps.ver.outputs.version }}
           files: |
