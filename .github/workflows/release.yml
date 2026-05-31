@@ -1,0 +1,115 @@
+name: release
+
+# Push a tag like v0.1.0 to build + publish a release. (Manual runs build the
+# artifacts but don't publish.) The baked-in version comes from the tag
+# (v0.1.5 -> 0.1.5); for manual runs it falls back to 0.1.<run_number>.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -match '^v(\d+\.\d+\.\d+.*)$') { $v = $Matches[1] }
+          else { $v = "0.1.${{ github.run_number }}" }
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "version = $v"
+
+      - name: Setup MSVC (cl / lib / dumpbin on PATH)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Ninja + OBS Studio
+        run: |
+          choco install ninja --no-progress -y
+          # OBS provides obs.dll, used for the import lib + to pin the headers.
+          choco install obs-studio --no-progress -y --version=32.1.2
+
+      - name: Fetch libobs headers (matching the installed OBS)
+        run: |
+          $pv = (Get-Item "C:\Program Files\obs-studio\bin\64bit\obs.dll").VersionInfo.ProductVersion
+          $obsVer = if ($pv -match '^(\d+\.\d+\.\d+)') { $Matches[1] } else { "32.1.2" }
+          git clone --depth 1 --branch $obsVer --single-branch `
+            https://github.com/obsproject/obs-studio.git deps/obs-studio
+
+      - name: Generate obs.lib from obs.dll
+        run: |
+          $dll = "C:\Program Files\obs-studio\bin\64bit\obs.dll"
+          New-Item -ItemType Directory -Force deps/obslib | Out-Null
+          dumpbin /exports $dll > exports.txt
+          $names = foreach ($l in Get-Content exports.txt) {
+            if ($l -match '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)') { $Matches[1] }
+          }
+          $names = $names | Where-Object { $_ -and $_ -ne '=' } | Sort-Object -Unique
+          @("EXPORTS") + $names | Set-Content deps/obslib/obs.def -Encoding ascii
+          lib /def:deps/obslib/obs.def /out:deps/obslib/obs.lib /machine:x64 /nologo
+
+      - name: Fetch ONNX Runtime (DirectML)
+        run: ./deps/get_onnxruntime.ps1
+
+      - name: Download depth model
+        env:
+          MODEL_URL: ${{ vars.MODEL_URL }}
+          MODEL_SHA256: ${{ vars.MODEL_SHA256 }}
+          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          if (-not $env:MODEL_URL) {
+            throw "Set the repository variable MODEL_URL to a direct download link for depth_anything_v2_small.onnx (Settings > Secrets and variables > Actions > Variables)."
+          }
+          # A published (tag) release must verify the externally hosted model.
+          if (($env:IS_TAG -eq 'true') -and (-not $env:MODEL_SHA256)) {
+            throw "Tag releases require the repository variable MODEL_SHA256 to verify the downloaded model. Set it (Settings > Secrets and variables > Actions > Variables)."
+          }
+          New-Item -ItemType Directory -Force models | Out-Null
+          $mdl = "models/depth_anything_v2_small.onnx"
+          Invoke-WebRequest -Uri $env:MODEL_URL -OutFile $mdl
+          if ($env:MODEL_SHA256) {
+            $got = (Get-FileHash $mdl -Algorithm SHA256).Hash.ToLower()
+            if ($got -ne $env:MODEL_SHA256.ToLower()) {
+              throw "model SHA-256 mismatch: got $got, expected $($env:MODEL_SHA256)"
+            }
+            Write-Host "model SHA-256 verified"
+          } else {
+            Write-Warning "MODEL_SHA256 not set - skipping model integrity check (non-tag build)"
+          }
+
+      - name: Configure + build
+        run: |
+          cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl `
+            -DPLUGIN_VERSION=${{ steps.ver.outputs.version }}
+          cmake --build build
+
+      - name: Package (zip + installer)
+        run: ./package.ps1 -Version ${{ steps.ver.outputs.version }}
+
+      - name: Upload artifacts (every run)
+        uses: actions/upload-artifact@v4
+        with:
+          name: near-real3d-${{ steps.ver.outputs.version }}
+          path: dist/*
+
+      - name: Publish release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: near Real 3D ${{ steps.ver.outputs.version }}
+          files: |
+            dist/*.zip
+            dist/*installer.exe
+          generate_release_notes: true

@@ -1,0 +1,41 @@
+THIRD-PARTY LICENSES
+====================
+
+near Real 3D (obs-near-real3d) is licensed under GPL-2.0-or-later (see LICENSE).
+
+The plugin links against libobs (part of OBS Studio, GPL-2.0-or-later) and, in
+its binary release packages, bundles the third-party runtime components listed
+below. The full text of each license is in the licenses/ directory (present in
+this repository and copied into every release package).
+
+The depth model is an Apache-2.0 build (Depth Anything V2 *Small*); the Base and
+Large checkpoints are CC-BY-NC-4.0 and are NOT used or distributed here.
+
+--------------------------------------------------------------------------------
+1. ONNX Runtime (with the DirectML execution provider)
+   https://github.com/microsoft/onnxruntime
+   File shipped: onnxruntime.dll
+   License: MIT (Copyright (c) Microsoft Corporation)
+   Full text: licenses/OnnxRuntime-MIT.txt
+
+--------------------------------------------------------------------------------
+2. DirectML
+   https://github.com/microsoft/DirectML  (https://aka.ms/DirectML)
+   File shipped: DirectML.dll (v1.15.4, from the Microsoft.AI.DirectML package)
+   License: Microsoft Software License Terms - Microsoft DirectX Machine
+            Learning (DirectML). Redistribution of the unmodified binary is
+            permitted under those terms.
+   Full text: licenses/DirectML-LICENSE.txt
+              licenses/DirectML-ThirdPartyNotices.txt
+
+--------------------------------------------------------------------------------
+3. Depth Anything V2 (Small) - depth estimation model weights
+   https://github.com/DepthAnything/Depth-Anything-V2
+   File shipped: depth_anything_v2_small.onnx (exported to ONNX)
+   License: Apache License 2.0 (Copyright (c) the Depth Anything V2 authors)
+   Full text: licenses/Apache-2.0.txt
+
+--------------------------------------------------------------------------------
+Build-time only (NOT distributed in the plugin binary):
+- OBS Studio / libobs headers + import library - GPL-2.0-or-later
+  https://github.com/obsproject/obs-studio

@@ -1,0 +1,93 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 8796n <info@8796.jp>
+/*
+ * obs-near-real3d SBS warp effect.
+ *
+ * Backward depth-image-based warp into a side-by-side stereo layout (the GPU
+ * analogue of libnr_depth_manager's GenDepthShiftedImage / mesh warp). The
+ * output frame is split into a left half and a right half; each half is the
+ * full source image warped horizontally by a disparity derived from depth.
+ *
+ * Phase 1: depth is a procedural stand-in (luminance = nearness) so the path is
+ * testable without ONNX. Phase 2 sets use_depth_tex=1 and binds a real depth
+ * texture from the monodepth model.
+ */
+uniform float4x4 ViewProj;
+uniform texture2d image;        // source frame (set by OBS)
+uniform texture2d depth_tex;    // depth map (Phase 2), R = nearness in [0,1]
+
+uniform float strength;         // max disparity as fraction of eye width
+uniform float convergence;      // zero-parallax plane in [0,1]
+uniform float swap_sign;        // +1 or -1 to flip left/right
+uniform float use_depth_tex;    // 0 = procedural luminance depth, 1 = depth_tex
+uniform float show_depth;       // debug: 1 = output the depth map as grayscale
+uniform float2 eye_fit;         // source sub-rect in each eye; (1,1) = stretch-fill
+
+sampler_state linClamp {
+	Filter   = Linear;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData o;
+	o.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	o.uv = v_in.uv;
+	return o;
+}
+
+float depth_at(float2 uv)
+{
+	if (use_depth_tex > 0.5)
+		return depth_tex.Sample(linClamp, uv).r;
+	float3 c = image.Sample(linClamp, uv).rgb;     // luminance stand-in
+	return dot(c, float3(0.299, 0.587, 0.114));
+}
+
+float4 PSStereoSBS(VertData v_in) : TARGET
+{
+	// Split output into two halves; map each half back to full [0,1] eye uv.
+	float eyeRight = step(0.5, v_in.uv.x);          // 0 = left, 1 = right
+	float ex = (v_in.uv.x - eyeRight * 0.5) * 2.0;  // 0..1 across the eye
+	// Aspect-fit the source into each eye; eye_fit=(1,1) is stretch-fill. Samples
+	// outside the fitted source become black bars (letterbox/pillarbox).
+	float2 euv = float2((ex - 0.5) / eye_fit.x + 0.5,
+			    (v_in.uv.y - 0.5) / eye_fit.y + 0.5);
+	float inside = step(0.0, euv.x) * step(euv.x, 1.0) *
+		       step(0.0, euv.y) * step(euv.y, 1.0);
+
+	// Debug: left eye = depth map (grayscale), right eye = the source image, so
+	// depth can be compared against the source side by side. Handy for tuning the
+	// static-skip threshold: the depth freezes while inference is skipped, while
+	// the source keeps updating -- the skip becomes visible at a glance.
+	if (show_depth > 0.5) {
+		float dd = depth_at(euv);
+		float3 c = (eyeRight < 0.5) ? float3(dd, dd, dd)
+					   : image.Sample(linClamp, euv).rgb;
+		return float4(c * inside, 1.0);
+	}
+
+	float d = depth_at(euv);
+	float disp = strength * (d - convergence);      // + for nearer than screen
+	// left and right eyes shift in opposite directions
+	float sgn = lerp(-swap_sign, swap_sign, eyeRight);
+	float2 suv = float2(euv.x + sgn * disp * 0.5, euv.y);
+	float4 col = image.Sample(linClamp, suv);
+	col.rgb *= inside;
+	return col;
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSStereoSBS(v_in);
+	}
+}
