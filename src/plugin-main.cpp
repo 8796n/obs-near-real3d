@@ -123,15 +123,18 @@ struct real3d_filter {
 	bool stage_primed = false;     /* false until both surfaces hold a frame */
 	gs_texture_t *depth_tex = nullptr;  /* INFER_SIZE^2 R32F */
 
-	/* tunables */
-	float frac = 0.018f, convergence = 0.5f, swap_sign = 1.0f;
-	bool full_sbs = true;
-	int sbs_size = 0;          /* 0 = match source, 1 = 1080p (1920x1080/eye) */
-	bool eye_letterbox = false; /* aspect-fit source into each eye (vs stretch) */
-	bool show_depth = false;
+	/* tunables -- written by real3d_update (UI thread), read on the graphics
+	 * thread (render / inference / size queries). Atomic (relaxed) since there
+	 * is no inter-field ordering requirement, just race-free scalar access,
+	 * matching input_smooth/sync_delay/ort.* below. */
+	std::atomic<float> frac{0.018f}, convergence{0.5f}, swap_sign{1.0f};
+	std::atomic<bool> full_sbs{true};
+	std::atomic<int> sbs_size{0};   /* 0 = match source, 1 = 1080p (1920x1080/eye) */
+	std::atomic<bool> eye_letterbox{false}; /* aspect-fit source into each eye (vs stretch) */
+	std::atomic<bool> show_depth{false};
 	std::atomic<bool> input_smooth{true}; /* mild blur on inference input */
-	bool logged_dims = false;
-	uint64_t infer_interval_ns = 66666666ULL; /* depth cadence; 15 fps default */
+	std::atomic<bool> logged_dims{false};
+	std::atomic<uint64_t> infer_interval_ns{66666666ULL}; /* depth cadence; 15 fps default */
 
 	/* ONNX + flow-guided temporal stabiliser + worker */
 	OrtDepth ort;
@@ -155,8 +158,8 @@ struct real3d_filter {
 	 * the depth already in depth_tex instead of re-running ONNX */
 	std::vector<uint8_t> readback; /* reused INFER_SIZE^2*4 readback scratch (graphics thread) */
 	std::vector<uint8_t> prev_in; /* last *inferred* INFER_SIZE^2*4 frame */
-	bool skip_static = true;
-	float static_thresh = 1.0f;   /* mean abs RGB diff (0-255); 0 = exact */
+	std::atomic<bool> skip_static{true};       /* UI thread writes, graphics reads */
+	std::atomic<float> static_thresh{1.0f};    /* mean abs RGB diff (0-255); 0 = exact */
 	int settle_left = 0;          /* remaining settle inferences after motion */
 
 	/* scene-cut handling (graphics thread only, except in_gen/out_gen under m).
@@ -317,23 +320,25 @@ static void real3d_update(void *data, obs_data_t *s)
 	long long tier = obs_data_get_int(s, "strength");
 	if (tier < 0 || tier > 4)
 		tier = 2;
-	f->frac = STRENGTH_FRAC[tier];   /* tier 0 -> 0 disparity (flat, A/B) */
-	f->convergence = (float)obs_data_get_double(s, "convergence");
-	f->swap_sign = obs_data_get_bool(s, "swap") ? -1.0f : 1.0f;
-	bool prev = f->full_sbs;
-	f->full_sbs = obs_data_get_bool(s, "full_sbs");
-	f->sbs_size = (int)obs_data_get_int(s, "sbs_size");
-	f->eye_letterbox = obs_data_get_bool(s, "eye_letterbox");
-	if (prev != f->full_sbs)
-		f->logged_dims = false; /* re-log new output size once */
+	const auto rel = std::memory_order_relaxed;
+	f->frac.store(STRENGTH_FRAC[tier], rel); /* tier 0 -> 0 disparity (flat, A/B) */
+	f->convergence.store((float)obs_data_get_double(s, "convergence"), rel);
+	f->swap_sign.store(obs_data_get_bool(s, "swap") ? -1.0f : 1.0f, rel);
+	bool prev = f->full_sbs.load(rel);
+	bool full_sbs = obs_data_get_bool(s, "full_sbs");
+	f->full_sbs.store(full_sbs, rel);
+	f->sbs_size.store((int)obs_data_get_int(s, "sbs_size"), rel);
+	f->eye_letterbox.store(obs_data_get_bool(s, "eye_letterbox"), rel);
+	if (prev != full_sbs)
+		f->logged_dims.store(false, rel); /* re-log new output size once */
 
 	long long fps = obs_data_get_int(s, "infer_fps");
 	if (fps < 1 || fps > 60)
 		fps = 15;
-	f->infer_interval_ns = 1000000000ULL / (uint64_t)fps;
+	f->infer_interval_ns.store(1000000000ULL / (uint64_t)fps, rel);
 
-	f->skip_static = obs_data_get_bool(s, "skip_static");
-	f->static_thresh = (float)obs_data_get_double(s, "static_thresh");
+	f->skip_static.store(obs_data_get_bool(s, "skip_static"), rel);
+	f->static_thresh.store((float)obs_data_get_double(s, "static_thresh"), rel);
 
 	f->ort.temporal.store(obs_data_get_bool(s, "temporal"),
 			      std::memory_order_relaxed);
@@ -347,7 +352,7 @@ static void real3d_update(void *data, obs_data_t *s)
 				   std::memory_order_relaxed);
 	f->ort.depth_smooth.store((float)obs_data_get_double(s, "depth_smooth"),
 				  std::memory_order_relaxed);
-	f->show_depth = obs_data_get_bool(s, "show_depth");
+	f->show_depth.store(obs_data_get_bool(s, "show_depth"), rel);
 	f->input_smooth.store(obs_data_get_bool(s, "input_smooth"),
 			      std::memory_order_relaxed);
 	/* Frame-matched delay: just record intent here; acquiring/releasing the
@@ -567,7 +572,7 @@ static void real3d_defaults(obs_data_t *s)
 static void eye_dims(const real3d_filter *f, uint32_t srcW, uint32_t srcH,
 		     uint32_t &eyeW, uint32_t &eyeH)
 {
-	if (f->sbs_size == 1) { eyeW = 1920; eyeH = 1080; }
+	if (f->sbs_size.load(std::memory_order_relaxed) == 1) { eyeW = 1920; eyeH = 1080; }
 	else { eyeW = srcW; eyeH = srcH; }
 }
 
@@ -582,7 +587,7 @@ static uint32_t real3d_get_width(void *data)
 	uint32_t eyeW, eyeH;
 	eye_dims(f, obs_source_get_base_width(t),
 		 obs_source_get_base_height(t), eyeW, eyeH);
-	return f->full_sbs ? eyeW * 2 : eyeW;
+	return f->full_sbs.load(std::memory_order_relaxed) ? eyeW * 2 : eyeW;
 }
 
 static uint32_t real3d_get_height(void *data)
@@ -777,7 +782,8 @@ static void maybe_submit_inference(real3d_filter *f, gs_texture_t *full)
 	/* No cut: honour the infer cadence and the worker's real throughput. The
 	 * readback above still ran at the detect rate, so cuts are caught between
 	 * inferences; here we only gate the expensive ONNX submission. */
-	if (now - f->last_submit_ns < f->infer_interval_ns)
+	if (now - f->last_submit_ns <
+	    f->infer_interval_ns.load(std::memory_order_relaxed))
 		return;
 	{
 		std::lock_guard<std::mutex> lk(f->m);
@@ -795,8 +801,9 @@ static void maybe_submit_inference(real3d_filter *f, gs_texture_t *full)
 	 * steady state *before* freezing -- without this, a motion trail or post-cut
 	 * ghost gets frozen in and never clears while inference is skipped. */
 	const bool is_static =
-		f->skip_static &&
-		frame_is_static(tight, f->prev_in, f->static_thresh);
+		f->skip_static.load(std::memory_order_relaxed) &&
+		frame_is_static(tight, f->prev_in,
+				f->static_thresh.load(std::memory_order_relaxed));
 	if (is_static) {
 		if (f->settle_left == 0)
 			return; /* settled & static -> keep the frozen depth */
@@ -1038,16 +1045,15 @@ static void real3d_video_render(void *data, gs_effect_t *)
 		gs_effect_set_texture_srgb(f->p_image, show);
 	else
 		gs_effect_set_texture(f->p_image, show);
+	const auto rel = std::memory_order_relaxed;
+	const bool full_sbs = f->full_sbs.load(rel);
 	gs_effect_set_texture(f->p_depthtex, f->depth_tex);
-	gs_effect_set_float(f->p_strength, f->frac * f->disp_scale);
-	gs_effect_set_float(f->p_conv, f->convergence);
-	gs_effect_set_float(f->p_swap, f->swap_sign);
+	gs_effect_set_float(f->p_strength, f->frac.load(rel) * f->disp_scale);
+	gs_effect_set_float(f->p_conv, f->convergence.load(rel));
+	gs_effect_set_float(f->p_swap, f->swap_sign.load(rel));
 	gs_effect_set_float(f->p_usedepth,
-			    (f->ort_ok &&
-			     f->ort_live.load(std::memory_order_relaxed))
-				    ? 1.0f
-				    : 0.0f);
-	gs_effect_set_float(f->p_showdepth, f->show_depth ? 1.0f : 0.0f);
+			    (f->ort_ok && f->ort_live.load(rel)) ? 1.0f : 0.0f);
+	gs_effect_set_float(f->p_showdepth, f->show_depth.load(rel) ? 1.0f : 0.0f);
 
 	/* per-eye target size + optional aspect-fit (letterbox) of the source */
 	uint32_t eyeW, eyeH;
@@ -1055,7 +1061,7 @@ static void real3d_video_render(void *data, gs_effect_t *)
 	struct vec2 efit;
 	efit.x = 1.0f;
 	efit.y = 1.0f;
-	if (f->eye_letterbox && w && h && eyeW && eyeH) {
+	if (f->eye_letterbox.load(rel) && w && h && eyeW && eyeH) {
 		const float src_a = (float)w / (float)h;
 		const float eye_a = (float)eyeW / (float)eyeH;
 		const float ratio = src_a / eye_a;
@@ -1066,12 +1072,12 @@ static void real3d_video_render(void *data, gs_effect_t *)
 	}
 	gs_effect_set_vec2(f->p_eyefit, &efit);
 
-	const uint32_t out_w = f->full_sbs ? eyeW * 2 : eyeW;
+	const uint32_t out_w = full_sbs ? eyeW * 2 : eyeW;
 	const uint32_t out_h = eyeH;
-	if (!f->logged_dims) {
-		f->logged_dims = true;
+	if (!f->logged_dims.load(rel)) {
+		f->logged_dims.store(true, rel);
 		blog(LOG_INFO, "[near-real3d] output %ux%u (%s, source %ux%u) linear_srgb=%d",
-		     out_w, out_h, f->full_sbs ? "Full-SBS" : "Half-SBS", w, h,
+		     out_w, out_h, full_sbs ? "Full-SBS" : "Half-SBS", w, h,
 		     (int)linear_srgb);
 	}
 	while (gs_effect_loop(f->effect, "Draw"))
