@@ -153,6 +153,7 @@ struct real3d_filter {
 
 	/* static-frame skip: when the downscaled input barely changes we reuse
 	 * the depth already in depth_tex instead of re-running ONNX */
+	std::vector<uint8_t> readback; /* reused INFER_SIZE^2*4 readback scratch (graphics thread) */
 	std::vector<uint8_t> prev_in; /* last *inferred* INFER_SIZE^2*4 frame */
 	bool skip_static = true;
 	float static_thresh = 1.0f;   /* mean abs RGB diff (0-255); 0 = exact */
@@ -731,7 +732,12 @@ static void maybe_submit_inference(real3d_filter *f, gs_texture_t *full)
 	uint32_t linesize = 0;
 	if (!gs_stagesurface_map(readback, &data, &linesize))
 		return;
-	std::vector<uint8_t> tight((size_t)INFER_SIZE * INFER_SIZE * 4);
+	/* Reuse a member buffer instead of allocating each detect-tick: resize is a
+	 * no-op once the capacity is established, so the per-frame readback fill no
+	 * longer churns the heap on the graphics thread (this runs every tick, even
+	 * while static-skipping). */
+	f->readback.resize((size_t)INFER_SIZE * INFER_SIZE * 4);
+	std::vector<uint8_t> &tight = f->readback;
 	for (int y = 0; y < INFER_SIZE; ++y)
 		memcpy(&tight[(size_t)y * INFER_SIZE * 4],
 		       data + (size_t)y * linesize,
@@ -802,7 +808,11 @@ static void maybe_submit_inference(real3d_filter *f, gs_texture_t *full)
 	f->prev_in = tight; /* baseline for the next comparison */
 	{
 		std::lock_guard<std::mutex> lk(f->m);
-		f->in_buf.swap(tight);
+		/* Copy (not swap): tight aliases the reused f->readback, so swapping
+		 * would hand its buffer to the worker and force a re-alloc next tick.
+		 * The worker's swap returns an INFER-sized buffer to in_buf, so this
+		 * copy reuses that capacity and stays alloc-free in the steady state. */
+		f->in_buf = tight;
 		f->in_gen = f->scene_gen;
 		f->in_ts = readback_ts;
 		f->input_ready = true;
