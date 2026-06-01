@@ -29,7 +29,7 @@ target_link_libraries(obs-near-real3d PRIVATE
 set_target_properties(obs-near-real3d PROPERTIES PREFIX "" OUTPUT_NAME "obs-near-real3d")
 
 # Version string baked into the binary (shown in the filter UI + logs). CI
-# overrides it for releases, e.g. -DPLUGIN_VERSION=0.1.${GITHUB_RUN_NUMBER};
+# overrides it for releases, e.g. -DPLUGIN_VERSION=v0.1.1 for a tag build;
 # local/IDE builds fall back to the project version with a -dev suffix.
 if(NOT DEFINED PLUGIN_VERSION OR PLUGIN_VERSION STREQUAL "")
   set(PLUGIN_VERSION "${PROJECT_VERSION}-dev")
