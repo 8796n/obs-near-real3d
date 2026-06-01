@@ -140,6 +140,80 @@ inline void gaussianBlur(std::vector<float> &im, int w, int h, float sigma)
 		}
 }
 
+/* separable max filter over a (2r+1)^2 window, replicate borders */
+inline void maxFilter(std::vector<float> &im, int w, int h, int r)
+{
+	if (r < 1)
+		return;
+	auto cl = [](int i, int n) { return i < 0 ? 0 : (i >= n ? n - 1 : i); };
+	std::vector<float> tmp((size_t)w * h);
+	for (int y = 0; y < h; ++y) {
+		const float *row = &im[(size_t)y * w];
+		float *out = &tmp[(size_t)y * w];
+		for (int x = 0; x < w; ++x) {
+			float m = row[x];
+			for (int k = -r; k <= r; ++k)
+				m = std::max(m, row[cl(x + k, w)]);
+			out[x] = m;
+		}
+	}
+	for (int x = 0; x < w; ++x)
+		for (int y = 0; y < h; ++y) {
+			float m = tmp[(size_t)y * w + x];
+			for (int k = -r; k <= r; ++k)
+				m = std::max(m, tmp[(size_t)cl(y + k, h) * w + x]);
+			im[(size_t)y * w + x] = m;
+		}
+}
+
+/* Edge-localised depth softening. A plain global blur rounds off *all* depth
+ * detail and bleeds the foreground silhouette outward; here we feather only the
+ * depth discontinuities, where the backward warp tears (DIBR rubber-sheet),
+ * and leave flat/smoothly-varying regions crisp. We build a per-pixel weight
+ * from the depth-gradient magnitude (flat = 0, steep edge = 1), dilate it to
+ * cover the blur's footprint so the whole transition band feathers at full
+ * strength (not just the one-pixel gradient spike), soften the weight boundary,
+ * then blend the depth toward a blurred copy by that weight. */
+inline void edgeSoftenDepth(std::vector<float> &depth, int size, float sigma,
+			    float edge_lo, float edge_hi)
+{
+	if (sigma <= 0.f)
+		return;
+	const int n = size * size;
+	if ((int)depth.size() != n || edge_hi <= edge_lo)
+		return;
+
+	std::vector<float> w((size_t)n);
+	const float inv_span = 1.f / (edge_hi - edge_lo);
+	for (int y = 0; y < size; ++y)
+		for (int x = 0; x < size; ++x) {
+			const int xm = x > 0 ? x - 1 : 0;
+			const int xp = x < size - 1 ? x + 1 : size - 1;
+			const int ym = y > 0 ? y - 1 : 0;
+			const int yp = y < size - 1 ? y + 1 : size - 1;
+			const float gx = 0.5f * (depth[(size_t)y * size + xp] -
+						 depth[(size_t)y * size + xm]);
+			const float gy = 0.5f * (depth[(size_t)yp * size + x] -
+						 depth[(size_t)ym * size + x]);
+			float t = (std::sqrt(gx * gx + gy * gy) - edge_lo) * inv_span;
+			t = t < 0.f ? 0.f : (t > 1.f ? 1.f : t);
+			w[(size_t)y * size + x] = t * t * (3.f - 2.f * t); /* smoothstep */
+		}
+
+	int r = (int)std::lround(sigma);
+	if (r < 1)
+		r = 1;
+	maxFilter(w, size, size, r);            /* cover the feather band */
+	gaussianBlur(w, size, size, sigma * 0.5f); /* soften the weight boundary */
+
+	std::vector<float> blurred = depth;
+	gaussianBlur(blurred, size, size, sigma);
+	for (int i = 0; i < n; ++i) {
+		float ww = w[i] < 0.f ? 0.f : (w[i] > 1.f ? 1.f : w[i]);
+		depth[i] += ww * (blurred[i] - depth[i]);
+	}
+}
+
 /* Clamp history to the range represented by the current 3x3 neighbourhood.
  * This removes stale foreground depth where an object has already moved away. */
 inline void clipHistory3x3(const std::vector<float> &cur,
@@ -435,9 +509,13 @@ public:
 		has_prev_ = enabled; /* off -> fresh start when re-enabled */
 
 		/* Soften depth edges so the backward warp feathers instead of tearing
-		 * at silhouettes (DIBR rubber-sheet, grows with disparity). */
+		 * at silhouettes (DIBR rubber-sheet, grows with disparity). Edge-
+		 * localised: only the depth discontinuities are feathered, so flat
+		 * regions keep their full depth detail (a global blur rounded off the
+		 * whole 3D and bled the foreground outward). */
 		if (smooth_sigma > 0.f && (int)out.size() == n)
-			nr3d::gaussianBlur(out, size, size, smooth_sigma);
+			nr3d::edgeSoftenDepth(out, size, smooth_sigma, EDGE_LO,
+					      EDGE_HI);
 	}
 
 private:
@@ -451,6 +529,10 @@ private:
 	static constexpr float REACTIVE_IMAGE = 18.0f;  /* warped luma residual */
 	static constexpr float REACTIVE_DIRECT = 30.0f; /* thin fast-motion fallback */
 	static constexpr int REACTIVE_DILATE = 2;
+	/* edge-softening: depth-gradient magnitude (per px, normalised depth) below
+	 * EDGE_LO stays crisp, at/above EDGE_HI is fully feathered, smoothstep between */
+	static constexpr float EDGE_LO = 0.05f;
+	static constexpr float EDGE_HI = 0.25f;
 	bool has_prev_ = false;
 	bool have_range_ = false;
 	float mn_ema_ = 0.f, mx_ema_ = 0.f;
