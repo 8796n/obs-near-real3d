@@ -116,7 +116,7 @@ struct real3d_filter {
 		    *p_showdepth = nullptr, *p_eyefit = nullptr;
 
 	gs_texrender_t *rt_full = nullptr;  /* captured input at WxH */
-	gs_texrender_t *rt_small_pre = nullptr; /* 2*INFER_SIZE area-avg stage */
+	gs_texrender_t *rt_pre[2] = {nullptr, nullptr}; /* ping-pong halving pyramid */
 	gs_texrender_t *rt_small = nullptr; /* downscaled to INFER_SIZE^2 */
 	gs_stagesurf_t *stage[2] = {nullptr, nullptr}; /* GPU->CPU readback, ping-pong */
 	int stage_cur = 0;             /* surface staged this tick; map the other */
@@ -377,7 +377,8 @@ static void *real3d_create(obs_data_t *settings, obs_source_t *context)
 		f->p_eyefit = gs_effect_get_param_by_name(f->effect, "eye_fit");
 	}
 	f->rt_full = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
-	f->rt_small_pre = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+	f->rt_pre[0] = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+	f->rt_pre[1] = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
 	f->rt_small = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
 	f->stage[0] = gs_stagesurface_create(INFER_SIZE, INFER_SIZE, GS_RGBA);
 	f->stage[1] = gs_stagesurface_create(INFER_SIZE, INFER_SIZE, GS_RGBA);
@@ -428,8 +429,10 @@ static void real3d_destroy(void *data)
 		gs_effect_destroy(f->effect);
 	if (f->rt_full)
 		gs_texrender_destroy(f->rt_full);
-	if (f->rt_small_pre)
-		gs_texrender_destroy(f->rt_small_pre);
+	if (f->rt_pre[0])
+		gs_texrender_destroy(f->rt_pre[0]);
+	if (f->rt_pre[1])
+		gs_texrender_destroy(f->rt_pre[1]);
 	if (f->rt_small)
 		gs_texrender_destroy(f->rt_small);
 	if (f->stage[0])
@@ -658,37 +661,55 @@ static void maybe_submit_inference(real3d_filter *f, gs_texture_t *full)
 		return;
 	f->last_detect_ns = now;
 
-	/* Two-stage area-average downscale (full -> 2*INFER_SIZE -> INFER_SIZE).
-	 * A single large bilinear reduction under-samples (aliasing, and lets
-	 * compression banding through); halving in two steps box-averages the
-	 * footprint, giving the depth model a cleaner, de-banded input. Inference
-	 * path only -- the visible warp still samples the full-res frame, so output
-	 * sharpness is unaffected. */
+	/* Area-average downscale to the square inference size via a progressive 2:1
+	 * halving pyramid (a hand-rolled mipmap; libobs exposes no runtime mip-gen
+	 * and texrender can't mip). A single steep bilinear reduction only reads a
+	 * 2x2 footprint, so reducing by more than 2:1 (e.g. a 1920/4K source -> 784
+	 * in one step) under-samples and lets aliasing + compression banding through.
+	 * Halving repeatedly box-averages the whole footprint instead; the last step
+	 * squishes to INFER_SIZE^2, by which point each axis reduces by <=~2:1 so the
+	 * 2x2 bilinear tap is sufficient. Inference path only -- the visible warp
+	 * still samples the full-res frame, so output sharpness is unaffected. */
 	gs_effect_t *def = obs_get_base_effect(OBS_EFFECT_DEFAULT);
 	gs_eparam_t *dimg = gs_effect_get_param_by_name(def, "image");
 	struct vec4 clr;
 	vec4_zero(&clr);
-	const int PRE = INFER_SIZE * 2;
+	const uint32_t PRE = INFER_SIZE * 2;
 
-	gs_texrender_reset(f->rt_small_pre);
-	if (!gs_texrender_begin(f->rt_small_pre, PRE, PRE))
-		return;
-	gs_clear(GS_CLEAR_COLOR, &clr, 0.0f, 0);
-	gs_ortho(0.0f, (float)PRE, 0.0f, (float)PRE, -100.0f, 100.0f);
-	gs_effect_set_texture(dimg, full);
-	while (gs_effect_loop(def, "Draw"))
-		gs_draw_sprite(full, 0, PRE, PRE);
-	gs_texrender_end(f->rt_small_pre);
-	gs_texture_t *pre = gs_texrender_get_texture(f->rt_small_pre);
+	gs_texture_t *src = full;
+	uint32_t cw = gs_texture_get_width(full);
+	uint32_t ch = gs_texture_get_height(full);
+	int pp = 0; /* ping-pong index into rt_pre[] */
+	while (cw > PRE || ch > PRE) {
+		/* Halve each axis independently, only while it still exceeds PRE, so a
+		 * wide/ultrawide source doesn't over-shrink its short axis (which would
+		 * needlessly drop vertical depth detail before the final square step). */
+		const uint32_t nw = cw > PRE ? (cw + 1) / 2 : cw;
+		const uint32_t nh = ch > PRE ? (ch + 1) / 2 : ch;
+		gs_texrender_t *dst = f->rt_pre[pp];
+		gs_texrender_reset(dst);
+		if (!gs_texrender_begin(dst, nw, nh))
+			return;
+		gs_clear(GS_CLEAR_COLOR, &clr, 0.0f, 0);
+		gs_ortho(0.0f, (float)nw, 0.0f, (float)nh, -100.0f, 100.0f);
+		gs_effect_set_texture(dimg, src);
+		while (gs_effect_loop(def, "Draw"))
+			gs_draw_sprite(src, 0, nw, nh);
+		gs_texrender_end(dst);
+		src = gs_texrender_get_texture(dst);
+		cw = nw;
+		ch = nh;
+		pp ^= 1; /* next pass writes the other buffer, reads this one */
+	}
 
 	gs_texrender_reset(f->rt_small);
 	if (!gs_texrender_begin(f->rt_small, INFER_SIZE, INFER_SIZE))
 		return;
 	gs_clear(GS_CLEAR_COLOR, &clr, 0.0f, 0);
 	gs_ortho(0.0f, (float)INFER_SIZE, 0.0f, (float)INFER_SIZE, -100.0f, 100.0f);
-	gs_effect_set_texture(dimg, pre);
+	gs_effect_set_texture(dimg, src);
 	while (gs_effect_loop(def, "Draw"))
-		gs_draw_sprite(pre, 0, INFER_SIZE, INFER_SIZE);
+		gs_draw_sprite(src, 0, INFER_SIZE, INFER_SIZE);
 	gs_texrender_end(f->rt_small);
 
 	/* Double-buffered GPU->CPU readback: stage this frame into one surface and
