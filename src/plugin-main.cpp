@@ -1022,6 +1022,27 @@ static void real3d_video_render(void *data, gs_effect_t *)
 	gs_enable_framebuffer_srgb(prev_fb);
 }
 
+/* video_render manages the parent's audio sync offset while the filter is
+ * actively rendering, but it stops being called when the filter is disabled
+ * (bypassed) or its parent isn't being shown. Without this the parent would be
+ * left with our audio delay applied -- audio stays late while the (now
+ * un-warped / un-delayed) video plays, i.e. an A/V desync. tick runs every frame
+ * regardless of enabled/visible state (libobs ticks every source), so we hand
+ * the sync offset back here whenever the delay mode isn't actively in effect.
+ * On re-enable/re-show, video_render re-acquires and re-applies it. */
+static void real3d_video_tick(void *data, float)
+{
+	auto *f = static_cast<real3d_filter *>(data);
+	if (!f->sync_owned)
+		return; /* nothing taken over -> nothing to restore */
+	obs_source_t *parent = obs_filter_get_parent(f->context);
+	const bool active = f->sync_delay.load(std::memory_order_relaxed) &&
+			    obs_source_enabled(f->context) && parent &&
+			    obs_source_showing(parent);
+	if (!active)
+		release_audio_sync(f);
+}
+
 static struct obs_source_info real3d_filter_info = {};
 
 bool obs_module_load(void)
@@ -1041,6 +1062,7 @@ bool obs_module_load(void)
 	real3d_filter_info.get_width = real3d_get_width;
 	real3d_filter_info.get_height = real3d_get_height;
 	real3d_filter_info.video_render = real3d_video_render;
+	real3d_filter_info.video_tick = real3d_video_tick;
 	obs_register_source(&real3d_filter_info);
 	blog(LOG_INFO, "[near-real3d] loaded: %s (libobs %d.%d.%d)",
 	     REAL3D_BUILD_INFO, LIBOBS_API_MAJOR_VER, LIBOBS_API_MINOR_VER,
