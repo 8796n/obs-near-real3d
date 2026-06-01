@@ -158,14 +158,20 @@ struct real3d_filter {
 	float static_thresh = 1.0f;   /* mean abs RGB diff (0-255); 0 = exact */
 	int settle_left = 0;          /* remaining settle inferences after motion */
 
-	/* scene-cut handling (graphics thread only, except in_gen/out_gen under m) */
+	/* scene-cut handling (graphics thread only, except in_gen/out_gen under m).
+	 * The disparity is flattened (2D) whenever the frame we are about to warp
+	 * belongs to a newer scene than the depth we currently hold -- i.e.
+	 * shown_gen > depth_gen. Comparing the *displayed* frame's generation makes
+	 * this correct in frame-matched delay mode too: there the shown frame is
+	 * delayed by the ring, so the flat hold starts when the post-cut frame is
+	 * actually displayed (not when the cut is detected) and lifts when the
+	 * matching depth lands -- no needless flattening of the old scene's tail. */
 	uint64_t last_detect_ns = 0;  /* cut-detection cadence (canvas fps, capped) */
 	std::vector<uint8_t> prev_detect; /* previous frame sampled for cut detection */
-	uint32_t scene_gen = 0;       /* ++ on each detected cut */
-	uint32_t awaiting_gen = 0;    /* release the flat hold once out_gen reaches this */
-	bool hold_flat = false;       /* disparity pinned to 0 (2D) until post-cut depth */
+	uint32_t scene_gen = 0;       /* ++ on each detected cut; tags freshly captured frames */
+	uint32_t depth_gen = 0;       /* scene generation of the depth now in depth_tex */
 	float disp_scale = 1.0f;      /* 0..1 multiplier on frac; ramps back after a cut */
-	uint64_t cut_ns = 0;          /* when the current flat hold started (failsafe) */
+	uint64_t stale_since_ns = 0;  /* when the current flat hold started (0 = not flat); failsafe */
 	uint64_t last_render_ns = 0;  /* previous render timestamp, for fps-independent ramp */
 
 	/* frame-matched delay mode */
@@ -177,6 +183,7 @@ struct real3d_filter {
 	int commit_delay = -1;        /* committed delay in frames (drives video+audio); -1 = unset */
 	uint64_t last_commit_ns = 0;  /* throttles re-commits so audio offset stays steady */
 	std::vector<gs_texture_t *> ring; /* recent full-res frames (delay line) */
+	std::vector<uint32_t> ring_gen;   /* scene generation tag per ring slot */
 	int ring_w = 0, ring_h = 0;   /* ring slot dims (rebuild on source resize) */
 	int ring_widx = 0;            /* next slot to write */
 	int ring_filled = 0;          /* slots written so far (for warm-up) */
@@ -193,6 +200,7 @@ static void free_delay_ring(real3d_filter *f)
 		if (t)
 			gs_texture_destroy(t);
 	f->ring.clear();
+	f->ring_gen.clear();
 	f->ring_w = f->ring_h = 0;
 	f->ring_widx = f->ring_filled = 0;
 }
@@ -210,6 +218,7 @@ static void ensure_delay_ring(real3d_filter *f, uint32_t w, uint32_t h, int slot
 		return; /* already big enough at the right size */
 	free_delay_ring(f);
 	f->ring.resize((size_t)slots, nullptr);
+	f->ring_gen.assign((size_t)slots, 0);
 	for (int i = 0; i < slots; ++i)
 		f->ring[i] = gs_texture_create(w, h, GS_RGBA, 1, nullptr,
 					       GS_RENDER_TARGET);
@@ -719,11 +728,11 @@ static void maybe_submit_inference(real3d_filter *f, gs_texture_t *full)
 	f->prev_detect = tight;
 
 	if (cut) {
+		/* Just advance the generation and refresh the depth ASAP. The flat
+		 * hold is derived at warp time from shown_gen > depth_gen, so it
+		 * engages exactly when the post-cut frame reaches the screen (which,
+		 * in delay mode, is several frames after this detection). */
 		f->scene_gen++;
-		f->awaiting_gen = f->scene_gen;
-		f->hold_flat = true;
-		f->disp_scale = 0.0f;
-		f->cut_ns = now;
 		f->settle_left = SETTLE_FRAMES;
 		f->prev_in = tight; /* fresh static-skip baseline for the new scene */
 		f->last_submit_ns = now;
@@ -835,12 +844,11 @@ static void real3d_video_render(void *data, gs_effect_t *)
 			gs_texture_set_image(f->depth_tex,
 					     (const uint8_t *)got.data(),
 					     INFER_SIZE * sizeof(float), false);
-			/* A depth computed at/after the latest cut means the warp can
-			 * trust it again: release the flat hold so the disparity ramps
-			 * back in. A stale pre-cut result (got_gen < awaiting) is uploaded
-			 * but stays invisible while the disparity is still pinned flat. */
-			if (f->hold_flat && got_gen >= f->awaiting_gen)
-				f->hold_flat = false;
+			/* Record which scene this depth belongs to. The warp trusts the
+			 * depth (lets the disparity ramp back) once the frame being shown
+			 * is no newer than depth_gen; a stale pre-cut result is uploaded
+			 * but the disparity stays flat until the matching depth lands. */
+			f->depth_gen = got_gen;
 			/* Measure the capture->depth pipeline latency (LPF). This is how
 			 * far the image must be delayed in sync mode to match the depth. */
 			if (got_ts && now > got_ts) {
@@ -863,31 +871,14 @@ static void real3d_video_render(void *data, gs_effect_t *)
 		}
 	}
 
-	/* Scene-cut disparity fade: held at 0 (flat/2D) while waiting for the
-	 * post-cut depth, then ramped back to full over ~1/DISP_RAMP_PER_SEC s so
-	 * the 3D re-appears without a hard pop. fps-independent via the render dt.
-	 * A failsafe releases the hold if fresh depth never arrives (e.g. inference
-	 * failure) so the filter can't get stuck flat. */
-	{
-		if (f->hold_flat && now - f->cut_ns > FLATTEN_TIMEOUT_NS)
-			f->hold_flat = false;
-		const float dt = f->last_render_ns
-					 ? (float)(now - f->last_render_ns) * 1e-9f
-					 : 0.0f;
-		f->last_render_ns = now;
-		if (f->hold_flat) {
-			f->disp_scale = 0.0f;
-		} else if (f->disp_scale < 1.0f) {
-			f->disp_scale += DISP_RAMP_PER_SEC * dt;
-			if (f->disp_scale > 1.0f)
-				f->disp_scale = 1.0f;
-		}
-	}
-
 	/* Frame-matched delay: pick which buffered frame to warp so it lines up with
 	 * the depth we currently have, and delay the source audio to match. When the
-	 * mode is off, release the audio sync and free the ring. */
+	 * mode is off, release the audio sync and free the ring. shown_gen is the
+	 * scene generation of whatever frame we end up warping (the delayed ring
+	 * frame, or the current one when not delaying), used below to decide whether
+	 * the depth we hold matches it. */
 	gs_texture_t *show = full;
+	uint32_t shown_gen = f->scene_gen;
 	{
 		struct obs_video_info ovi;
 		uint64_t interval_ns = 0;
@@ -934,10 +925,12 @@ static void real3d_video_render(void *data, gs_effect_t *)
 				if (d > n - 1)
 					d = n - 1;
 				gs_copy_texture(f->ring[f->ring_widx], full);
+				f->ring_gen[f->ring_widx] = f->scene_gen;
 				if (d > 0 && f->ring_filled >= d) {
 					const int idx =
 						(f->ring_widx - d + n) % n;
 					show = f->ring[idx];
+					shown_gen = f->ring_gen[idx];
 					applied_d = d;
 				}
 				f->ring_widx = (f->ring_widx + 1) % n;
@@ -965,6 +958,40 @@ static void real3d_video_render(void *data, gs_effect_t *)
 			release_audio_sync(f);
 			if (!f->ring.empty())
 				free_delay_ring(f);
+		}
+	}
+
+	/* Scene-cut disparity fade. Flatten to 2D while the frame we are about to
+	 * warp (shown_gen) is from a newer scene than the depth we hold (depth_gen),
+	 * i.e. its matching depth hasn't arrived yet -- warping it with the previous
+	 * scene's depth is the glitch we are avoiding. Once depth catches up, ramp
+	 * back to full over ~1/DISP_RAMP_PER_SEC s so the 3D returns without a pop.
+	 * Comparing the *displayed* generation makes this correct in delay mode: the
+	 * hold starts when the post-cut frame actually reaches the screen and lifts
+	 * when its depth lands, instead of flattening the still-valid old-scene tail.
+	 * A failsafe lifts the hold if the matching depth never arrives (e.g.
+	 * inference failure) so the filter can't get stuck flat. */
+	{
+		const bool depth_stale = shown_gen > f->depth_gen;
+		if (depth_stale) {
+			if (!f->stale_since_ns)
+				f->stale_since_ns = now;
+		} else {
+			f->stale_since_ns = 0;
+		}
+		const bool failsafe =
+			f->stale_since_ns &&
+			now - f->stale_since_ns > FLATTEN_TIMEOUT_NS;
+		const float dt = f->last_render_ns
+					 ? (float)(now - f->last_render_ns) * 1e-9f
+					 : 0.0f;
+		f->last_render_ns = now;
+		if (depth_stale && !failsafe) {
+			f->disp_scale = 0.0f;
+		} else if (f->disp_scale < 1.0f) {
+			f->disp_scale += DISP_RAMP_PER_SEC * dt;
+			if (f->disp_scale > 1.0f)
+				f->disp_scale = 1.0f;
 		}
 	}
 
