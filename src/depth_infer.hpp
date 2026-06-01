@@ -47,6 +47,7 @@ public:
 	const std::string &last_error() const { return last_error_; }
 
 	std::atomic<bool> temporal{true};      /* temporal stabilisation on/off */
+	std::atomic<int> temporal_mode{0};     /* see TemporalMode in flow_stabilizer.hpp */
 	std::atomic<float> stab_strength{0.4f}; /* 0 = none .. 1 = heavy smoothing */
 	std::atomic<float> depth_smooth{0.3f}; /* 0..1 -> depth edge-softening sigma */
 

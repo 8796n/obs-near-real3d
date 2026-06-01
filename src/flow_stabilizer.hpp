@@ -12,10 +12,13 @@
  *      into the current frame and blend, so static AND tracked-moving regions are
  *      smoothed; large residuals (dis-occlusion / flow fail) fall back to the
  *      fresh depth;
- *   3. scene-cut detection -- on a hard cut the flow is meaningless and the EMA
+ *   3. optional history clipping + reactive rejection -- clamp warped history to
+ *      the current local depth range, and fully discard history near fast motion
+ *      or uncertain flow so thin movers do not leave depth trails;
+ *   4. scene-cut detection -- on a hard cut the flow is meaningless and the EMA
  *      scale lags ~0.7 s, so we detect the cut (mean frame diff) and snap both
  *      the range and the blend to the fresh frame (recovers in one depth frame);
- *   4. depth-edge softening (Gaussian) to reduce DIBR rubber-sheet tearing.
+ *   5. depth-edge softening (Gaussian) to reduce DIBR rubber-sheet tearing.
  *
  * Self-contained: the dense optical flow is a small pyramidal Lucas-Kanade
  * (no OpenCV). The depth map is low-frequency and the residual fallback masks
@@ -134,6 +137,47 @@ inline void gaussianBlur(std::vector<float> &im, int w, int h, float sigma)
 			for (int i = -r; i <= r; ++i)
 				acc += k[i + r] * tmp[(size_t)cl(y + i, h) * w + x];
 			im[(size_t)y * w + x] = acc;
+		}
+}
+
+/* Clamp history to the range represented by the current 3x3 neighbourhood.
+ * This removes stale foreground depth where an object has already moved away. */
+inline void clipHistory3x3(const std::vector<float> &cur,
+			   const std::vector<float> &history, int size,
+			   std::vector<float> &clipped)
+{
+	clipped.resize(history.size());
+	for (int y = 0; y < size; ++y)
+		for (int x = 0; x < size; ++x) {
+			float lo = cur[(size_t)y * size + x];
+			float hi = lo;
+			for (int dy = -1; dy <= 1; ++dy)
+				for (int dx = -1; dx <= 1; ++dx) {
+					const int xx = std::clamp(x + dx, 0, size - 1);
+					const int yy = std::clamp(y + dy, 0, size - 1);
+					const float v = cur[(size_t)yy * size + xx];
+					lo = std::min(lo, v);
+					hi = std::max(hi, v);
+				}
+			const size_t i = (size_t)y * size + x;
+			clipped[i] = std::clamp(history[i], lo, hi);
+		}
+}
+
+/* Expand unreliable-history pixels to cover antialiased / softened edges. */
+inline void dilateMask(std::vector<uint8_t> &mask, int size, int radius)
+{
+	const std::vector<uint8_t> src = mask;
+	for (int y = 0; y < size; ++y)
+		for (int x = 0; x < size; ++x) {
+			if (!src[(size_t)y * size + x])
+				continue;
+			for (int dy = -radius; dy <= radius; ++dy)
+				for (int dx = -radius; dx <= radius; ++dx) {
+					const int xx = std::clamp(x + dx, 0, size - 1);
+					const int yy = std::clamp(y + dy, 0, size - 1);
+					mask[(size_t)yy * size + xx] = 1;
+				}
 		}
 }
 
@@ -256,6 +300,12 @@ inline void denseFlowLK(const std::vector<float> &prev,
 
 } // namespace nr3d
 
+enum class TemporalMode {
+	Legacy = 0,
+	HistoryClip = 1,
+	ReactiveClip = 2,
+};
+
 class FlowStabilizer {
 public:
 	void reset()
@@ -269,7 +319,8 @@ public:
 	 * out: size*size stabilised, normalised depth in [0,1].
 	 * strength 0..1 (higher = steadier); smooth_sigma >=0 edge softening. */
 	void process(const uint8_t *rgba, int size, const std::vector<float> &raw,
-		     std::vector<float> &out, bool enabled, float strength,
+		     std::vector<float> &out, bool enabled, TemporalMode mode,
+		     float strength,
 		     float smooth_sigma)
 	{
 		const int n = size * size;
@@ -342,11 +393,38 @@ public:
 					wgray[i] = nr3d::bilinear(prev_gray_, size, size, sx, sy);
 				}
 
+			const std::vector<float> *history = &warped;
+			std::vector<float> clipped_history;
+			if (mode != TemporalMode::Legacy) {
+				nr3d::clipHistory3x3(cur, warped, size, clipped_history);
+				history = &clipped_history;
+			}
+
+			std::vector<uint8_t> reactive;
+			if (mode == TemporalMode::ReactiveClip) {
+				reactive.assign((size_t)n, 0);
+				for (int i = 0; i < n; ++i) {
+					const float dres = std::fabs(cur[i] - warped[i]);
+					const float ires = std::fabs(gray[i] - wgray[i]);
+					const float direct =
+						std::fabs(gray[i] - prev_gray_[i]);
+					if (dres > REACTIVE_DEPTH ||
+					    ires > REACTIVE_IMAGE ||
+					    direct > REACTIVE_DIRECT)
+						reactive[i] = 1;
+				}
+				nr3d::dilateMask(reactive, size, REACTIVE_DILATE);
+			}
+
 			float s = strength < 0.f ? 0.f
 						 : (strength > 1.f ? 1.f : strength);
 			const float alpha = 1.f - 0.92f * s;
 			out.resize((size_t)n);
 			for (int i = 0; i < n; ++i) {
+				if (!reactive.empty() && reactive[i]) {
+					out[i] = cur[i];
+					continue;
+				}
 				float dres = std::fabs(cur[i] - warped[i]);  /* depth resid 0..1 */
 				float dboost = (dres - GHOST_LO) * GHOST_INV_SPAN;
 				float ires = std::fabs(gray[i] - wgray[i]);  /* image resid 0..255 */
@@ -354,7 +432,7 @@ public:
 				float boost = dboost > iboost ? dboost : iboost;
 				boost = boost < 0.f ? 0.f : (boost > 1.f ? 1.f : boost);
 				float a = alpha + (1.f - alpha) * boost;
-				out[i] = a * cur[i] + (1.f - a) * warped[i];
+				out[i] = a * cur[i] + (1.f - a) * (*history)[i];
 			}
 		}
 
@@ -375,6 +453,10 @@ private:
 	static constexpr float GHOST_INV_SPAN = 1.0f / 0.25f;
 	static constexpr float IMG_LO = 18.0f;          /* anti-ghost image-residual fade lo (luma 0..255) */
 	static constexpr float IMG_INV_SPAN = 1.0f / 40.0f;
+	static constexpr float REACTIVE_DEPTH = 0.15f;  /* discard stale history */
+	static constexpr float REACTIVE_IMAGE = 18.0f;  /* warped luma residual */
+	static constexpr float REACTIVE_DIRECT = 30.0f; /* thin fast-motion fallback */
+	static constexpr int REACTIVE_DILATE = 2;
 	bool has_prev_ = false;
 	bool have_range_ = false;
 	float mn_ema_ = 0.f, mx_ema_ = 0.f;
