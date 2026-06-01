@@ -327,11 +327,12 @@ static void real3d_update(void *data, obs_data_t *s)
 
 	f->ort.temporal.store(obs_data_get_bool(s, "temporal"),
 			      std::memory_order_relaxed);
-	long long temporal_mode = obs_data_get_int(s, "temporal_mode");
-	if (temporal_mode < (long long)TemporalMode::Legacy ||
-	    temporal_mode > (long long)TemporalMode::ReactiveClip)
-		temporal_mode = (long long)TemporalMode::Legacy;
-	f->ort.temporal_mode.store((int)temporal_mode, std::memory_order_relaxed);
+	/* The temporal mode selector was a dev-time A/B comparison knob; fixed to
+	 * the most complete anti-trail mode (reactive mask + history clipping). The
+	 * enum and the other code paths stay in flow_stabilizer.hpp so it's a
+	 * one-line change to re-expose if ever needed. */
+	f->ort.temporal_mode.store((int)TemporalMode::ReactiveClip,
+				   std::memory_order_relaxed);
 	f->ort.stab_strength.store((float)obs_data_get_double(s, "stabilize_strength"),
 				   std::memory_order_relaxed);
 	f->ort.depth_smooth.store((float)obs_data_get_double(s, "depth_smooth"),
@@ -481,28 +482,30 @@ static obs_properties_t *real3d_properties(void *)
 	obs_property_list_add_int(fps, obs_module_text("fps.30"), 30);
 	obs_property_list_add_int(fps, obs_module_text("fps.60"), 60);
 	obs_property_set_long_description(fps, obs_module_text("fps.desc"));
-	q = obs_properties_add_bool(gst, "skip_static",
-				    obs_module_text("skipstatic"));
-	obs_property_set_long_description(q, obs_module_text("skipstatic.desc"));
-	q = obs_properties_add_float_slider(gst, "static_thresh",
+	/* Parent/child settings use checkable groups: the toggle is the group's
+	 * header checkbox and the dependent control sits (indented) inside it, so
+	 * the relationship is visible and the child is disabled in place -- no
+	 * jarring show/hide, and a disabled group can't be dragged. The checkbox
+	 * state is stored under the group name, same key as the old bool. */
+	obs_properties_t *g_skip = obs_properties_create();
+	q = obs_properties_add_float_slider(g_skip, "static_thresh",
 					    obs_module_text("staticthresh"), 0.0,
 					    8.0, 0.1);
 	obs_property_set_long_description(q, obs_module_text("staticthresh.desc"));
-	obs_properties_add_bool(gst, "temporal", obs_module_text("temporal"));
-	obs_property_t *tm = obs_properties_add_list(
-		gst, "temporal_mode", obs_module_text("temporalmode"),
-		OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(tm, obs_module_text("temporalmode.legacy"),
-				  (long long)TemporalMode::Legacy);
-	obs_property_list_add_int(tm, obs_module_text("temporalmode.clip"),
-				  (long long)TemporalMode::HistoryClip);
-	obs_property_list_add_int(tm, obs_module_text("temporalmode.reactive"),
-				  (long long)TemporalMode::ReactiveClip);
-	obs_property_set_long_description(tm, obs_module_text("temporalmode.desc"));
-	q = obs_properties_add_float_slider(gst, "stabilize_strength",
+	q = obs_properties_add_group(gst, "skip_static",
+				     obs_module_text("skipstatic"),
+				     OBS_GROUP_CHECKABLE, g_skip);
+	obs_property_set_long_description(q, obs_module_text("skipstatic.desc"));
+
+	obs_properties_t *g_temp = obs_properties_create();
+	q = obs_properties_add_float_slider(g_temp, "stabilize_strength",
 					    obs_module_text("stabstrength"), 0.0,
 					    1.0, 0.05);
 	obs_property_set_long_description(q, obs_module_text("stabstrength.desc"));
+	q = obs_properties_add_group(gst, "temporal", obs_module_text("temporal"),
+				     OBS_GROUP_CHECKABLE, g_temp);
+	obs_property_set_long_description(q, obs_module_text("temporal.desc"));
+
 	q = obs_properties_add_float_slider(gst, "depth_smooth",
 					    obs_module_text("edgesoft"), 0.0, 1.0,
 					    0.05);
@@ -539,7 +542,6 @@ static void real3d_defaults(obs_data_t *s)
 	obs_data_set_default_bool(s, "skip_static", true);
 	obs_data_set_default_double(s, "static_thresh", 1.0);
 	obs_data_set_default_bool(s, "temporal", true);
-	obs_data_set_default_int(s, "temporal_mode", (long long)TemporalMode::Legacy);
 	obs_data_set_default_double(s, "stabilize_strength", 0.4);
 	obs_data_set_default_double(s, "depth_smooth", 0.3);
 	obs_data_set_default_bool(s, "input_smooth", true);
