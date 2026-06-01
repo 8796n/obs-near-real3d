@@ -32,7 +32,7 @@
 /* Visible build stamp so the loaded DLL can be identified at a glance (shown in
  * the filter properties UI and logged on load). __DATE__/__TIME__ change every
  * rebuild, so a stale plugin is immediately obvious. The version is injected by
- * CMake (-DPLUGIN_VERSION, e.g. 0.1.<run_number> in CI); the fallback below is
+ * CMake (-DPLUGIN_VERSION, e.g. v0.1.1 for a tag build); the fallback below is
  * only used for IDE/standalone builds that don't define it. */
 #ifndef REAL3D_VERSION
 #define REAL3D_VERSION "0.1.0-dev"
