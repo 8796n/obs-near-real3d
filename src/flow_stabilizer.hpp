@@ -308,12 +308,6 @@ enum class TemporalMode {
 
 class FlowStabilizer {
 public:
-	void reset()
-	{
-		has_prev_ = false;
-		have_range_ = false;
-	}
-
 	/* rgba: size*size*4 tight (current frame, RGBA8).
 	 * raw: size*size raw inverse depth (higher = nearer) from the model.
 	 * out: size*size stabilised, normalised depth in [0,1].
