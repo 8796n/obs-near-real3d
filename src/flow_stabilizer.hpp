@@ -200,7 +200,13 @@ inline void edgeSoftenDepth(std::vector<float> &depth, int size, float sigma,
 			w[(size_t)y * size + x] = t * t * (3.f - 2.f * t); /* smoothstep */
 		}
 
-	int r = (int)std::lround(sigma);
+	/* Dilate the weight across the blurred copy's *full* footprint
+	 * (ceil(3*sigma) = gaussianBlur's own radius). A narrower band left a
+	 * residual depth step just outside it -- the warp then concentrated the
+	 * disocclusion stretch into that narrow band and the silhouette looked
+	 * sharply distorted. Covering the whole ramp makes the edge feather as
+	 * softly as a global blur would, while flat regions stay crisp. */
+	int r = (int)std::ceil(3.f * sigma);
 	if (r < 1)
 		r = 1;
 	maxFilter(w, size, size, r);            /* cover the feather band */
