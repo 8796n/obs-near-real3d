@@ -50,11 +50,13 @@ MODULE_EXPORT const char *obs_module_description(void)
 }
 
 static const float STRENGTH_FRAC[5] = {0.0f, 0.010f, 0.018f, 0.028f, 0.045f};
-/* Depth inference input dims (W x H), must match the exported ONNX. Square 392
- * today; a 16:9 model (e.g. 448x252) just changes these two constants and the
- * model file -- the whole inference path below is dimension-general. */
-static const int INFER_W = 392;
-static const int INFER_H = 392;
+/* Depth inference input dims (W x H), must match the exported ONNX. 16:9
+ * (448x252, both multiples of 14) to match the source/per-eye aspect: the model
+ * sees an undistorted image (vs an anamorphic square) and is ~0.73x the compute
+ * of 392^2 (576 vs 784 tokens). The whole inference path is dimension-general,
+ * so this plus the matching model file is the only change. */
+static const int INFER_W = 448;
+static const int INFER_H = 252;
 /* After motion stops, keep inferring this many "settle" frames so the temporal
  * blend converges to its ghost-free steady state before the static-skip freezes
  * the depth (otherwise a motion trail / post-cut ghost gets frozen in). */
