@@ -188,8 +188,8 @@ SBS 対応のグラス/ディスプレイへ送るなら、SBS 出力したシ�
    - `MODEL_SHA256` … モデルの SHA-256（**タグリリースでは必須**。未設定だと CI が失敗）。現行モデル（**448×252 / 16:9 / FP16**）の値:
      `3C8DE7CCC0FAA9E266B6389628B9823412F25D995202AB58D9306A50A185CC5C`
      （`Get-FileHash depth_anything_v2_small.onnx -Algorithm SHA256` で確認可。再生成は `tools/export_onnx.py --width 448 --height 252`）
-2. **リリース**: `v0.2.0` のような **タグを push** すると、CI が 依存取得 → `-DPLUGIN_VERSION=<タグ>` でビルド → `package.ps1` で ZIP＋インストーラ生成 → その Release に添付（バージョンはタグ由来。手動実行時は `0.2.<run_number>`）。
-3. **ローカルでも生成可**: `setup.ps1` → `build.ps1` → `package.ps1 -Version 0.2.0` で `dist/` に ZIP（＋Inno Setup があればインストーラ）。初回や CI 整備前の手動アップロードに。
+2. **リリース**: `v0.2.2` のような **タグを push** すると、CI が 依存取得 → `-DPLUGIN_VERSION=<タグ>` でビルド → `package.ps1` で ZIP＋インストーラ生成 → その Release に添付（バージョンはタグ由来。手動実行時は `0.2.<run_number>`）。
+3. **ローカルでも生成可**: `setup.ps1` → `build.ps1` → `package.ps1 -Version 0.2.2` で `dist/` に ZIP（＋Inno Setup があればインストーラ）。初回や CI 整備前の手動アップロードに。
 
 ## ライセンス
 
