@@ -111,10 +111,15 @@ static std::wstring utf8_to_wide(const char *s)
 {
 	if (!s)
 		return L"";
+	/* n counts the terminating NUL (source length is -1). Size the buffer to n
+	 * (room for the chars + NUL), convert, then trim the NUL from the length --
+	 * sizing to n-1 and writing n would write the terminator slot. */
 	int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
-	std::wstring w(n ? n - 1 : 0, L'\0');
-	if (n)
-		MultiByteToWideChar(CP_UTF8, 0, s, -1, &w[0], n);
+	if (n <= 0)
+		return L"";
+	std::wstring w((size_t)n, L'\0');
+	MultiByteToWideChar(CP_UTF8, 0, s, -1, &w[0], n);
+	w.resize((size_t)n - 1);
 	return w;
 }
 
