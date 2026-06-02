@@ -13,8 +13,8 @@ The input shape is fixed (no dynamic axes -- DirectML is ~5x slower with them).
 DA V2 (DINOv2 ViT, patch 14) accepts any width/height that are multiples of 14,
 so a non-square (e.g. 16:9) input can be exported to match the source aspect.
 
-  python tools/export_onnx.py                            # 392x392, FP16 (currently shipped)
-  python tools/export_onnx.py --width 448 --height 252   # 16:9, FP16 (both multiples of 14)
+  python tools/export_onnx.py                            # 448x252 (16:9), FP16 (currently shipped)
+  python tools/export_onnx.py --width 392 --height 392   # legacy square, FP16
   python tools/export_onnx.py --no-fp16                  # FP32 graph
 
 Requires: torch, transformers, onnx, onnxruntime (+ CUDA for FP16).
@@ -70,8 +70,10 @@ def wrap_fp32_io(src, dst):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default="depth-anything/Depth-Anything-V2-Small-hf")
-    ap.add_argument("--width", type=int, default=392, help="input width, multiple of 14")
-    ap.add_argument("--height", type=int, default=392, help="input height, multiple of 14")
+    # Defaults match the shipped model / the plugin's INFER_W x INFER_H (448x252,
+    # 16:9). A no-arg run reproduces the active model; override for other sizes.
+    ap.add_argument("--width", type=int, default=448, help="input width, multiple of 14")
+    ap.add_argument("--height", type=int, default=252, help="input height, multiple of 14")
     ap.add_argument("--out", default=DEFAULT_OUT)
     ap.add_argument("--no-fp16", action="store_true")
     args = ap.parse_args()
