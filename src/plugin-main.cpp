@@ -82,11 +82,6 @@ static const float DISP_RAMP_PER_SEC = 6.0f; /* disparity fade-in after a cut (~
 /* Failsafe: release the flat hold even if no post-cut depth ever arrives (e.g.
  * inference failure / worker stall) so the filter can't get stuck flat. */
 static const uint64_t FLATTEN_TIMEOUT_NS = 500000000ULL;
-/* A render gap longer than this means video_render was paused (the filter was
- * hidden/disabled), not just a slow frame. On resume we discard the delay
- * pipeline's pre-pause state so a stale capture timestamp isn't measured as a
- * giant inference latency. Far above any real frame interval (10 fps = 0.1 s). */
-static const uint64_t RESUME_GAP_NS = 500000000ULL;
 
 /* ---- frame-matched delay mode (optional) ----
  * The depth lags the image by the inference pipeline latency, so by default the
@@ -180,8 +175,8 @@ struct real3d_filter {
 
 	/* scene-cut handling (graphics thread only, except in_gen/out_gen under m).
 	 * The disparity is flattened (2D) whenever the frame we are about to warp
-	 * belongs to a newer scene than the depth we currently hold -- i.e.
-	 * shown_gen > depth_gen. Comparing the *displayed* frame's generation makes
+	 * and the depth we currently hold are from different scenes -- i.e.
+	 * shown_gen != depth_gen. Comparing the *displayed* frame's generation makes
 	 * this correct in frame-matched delay mode too: there the shown frame is
 	 * delayed by the ring, so the flat hold starts when the post-cut frame is
 	 * actually displayed (not when the cut is detected) and lifts when the
@@ -805,7 +800,7 @@ static void maybe_submit_inference(real3d_filter *f, gs_texture_t *full)
 
 	if (cut) {
 		/* Just advance the generation and refresh the depth ASAP. The flat
-		 * hold is derived at warp time from shown_gen > depth_gen, so it
+		 * hold is derived at warp time from shown_gen != depth_gen, so it
 		 * engages exactly when the post-cut frame reaches the screen (which,
 		 * in delay mode, is several frames after this detection). */
 		f->scene_gen++;
@@ -900,15 +895,6 @@ static void real3d_video_render(void *data, gs_effect_t *)
 	 * delay-mode latency), the depth-arrival time, and the ramp dt. */
 	const uint64_t now = os_gettime_ns();
 	f->cur_capture_ns = now;
-
-	/* Resume after a hide/disable (video_render was paused): drop the delay
-	 * pipeline's pre-pause state. Otherwise a readback/worker result captured
-	 * before the pause would be measured as `now - got_ts` -- the whole pause --
-	 * and briefly slam the delay ring (and audio offset) to its cap. */
-	if (f->last_render_ns && now - f->last_render_ns > RESUME_GAP_NS) {
-		f->stage_primed = false;   /* re-prime; discard the pre-pause staged frame */
-		f->latency_epoch_ns = now; /* ignore latency from captures before now */
-	}
 
 	capture_input(f, w, h, space);
 	gs_texture_t *full = gs_texrender_get_texture(f->rt_full);
@@ -1162,8 +1148,16 @@ static void real3d_video_tick(void *data, float)
 	const bool active = f->sync_delay.load(std::memory_order_relaxed) &&
 			    obs_source_enabled(f->context) && parent &&
 			    obs_source_showing(parent);
-	if (!active)
+	if (!active) {
+		/* Going inactive while owning the delay pipeline. Drop the pre-pause
+		 * latency state so a later resume (any duration -- even a quick hide,
+		 * which the render-side gap check would miss) can't feed the EMA a
+		 * sample spanning the hidden period. tick runs on the graphics thread,
+		 * so touching this render-owned state is safe. */
+		f->stage_primed = false;
+		f->latency_epoch_ns = os_gettime_ns();
 		release_audio_sync(f);
+	}
 }
 
 static struct obs_source_info real3d_filter_info = {};
