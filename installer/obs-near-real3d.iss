@@ -1,4 +1,4 @@
-; Inno Setup script for near Real 3D (obs-near-real3d).
+﻿; Inno Setup script for near Real 3D (obs-near-real3d).
 ; Built by package.ps1 / CI. The staged plugin tree must exist at
 ;   ..\dist\stage\obs-near-real3d\{bin\64bit, data, ...}
 ; Pass the version with:  ISCC.exe /DAppVersion=0.2.3 obs-near-real3d.iss
@@ -26,9 +26,18 @@ OutputBaseFilename=near-real3d-{#AppVersion}-windows-x64-installer
 UninstallDisplayName=near Real 3D (OBS plugin)
 WizardStyle=modern
 SolidCompression=yes
+; Pick the wizard language from the OS UI language automatically (no prompt).
+; English is listed first, so it's the fallback on any non-Japanese system.
+ShowLanguageDialog=no
+
+[Languages]
+Name: "en"; MessagesFile: "compiler:Default.isl"
+Name: "ja"; MessagesFile: "compiler:Languages\Japanese.isl"
 
 [Files]
 Source: "..\dist\stage\obs-near-real3d\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
 
+; Translate the custom welcome line per language (prefix = the [Languages] Name).
 [Messages]
-WelcomeLabel2=This will install the near Real 3D filter for OBS Studio.%n%nClose OBS Studio before continuing, then restart it after install.
+en.WelcomeLabel2=This will install the near Real 3D filter for OBS Studio.%n%nClose OBS Studio before continuing, then restart it after install.
+ja.WelcomeLabel2=OBS Studio 用の near Real 3D フィルターをインストールします。%n%n続行する前に OBS Studio を終了し、インストール後に再起動してください。
