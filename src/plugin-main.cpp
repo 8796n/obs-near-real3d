@@ -250,6 +250,14 @@ static void release_audio_sync(real3d_filter *f)
 	f->sync_owned = false;
 	f->applied_extra = -1;
 	f->commit_delay = -1;
+	/* Reset the ring's warm-up state too: when this release is due to the filter
+	 * going inactive (hidden/disabled via video_tick), the slots still hold
+	 * pre-pause frames. Without this, video_render would immediately show a slot
+	 * captured before the pause on resume (a few-frame rewind). Zeroing the
+	 * fill/write index re-warms the ring (shows the live frame until it refills),
+	 * matching the initial start-up behaviour. The textures are kept. */
+	f->ring_widx = 0;
+	f->ring_filled = 0;
 }
 
 static void worker_fn(real3d_filter *f)
