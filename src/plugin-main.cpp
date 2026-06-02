@@ -210,6 +210,9 @@ struct real3d_filter {
 	int ring_filled = 0;          /* slots written so far (for warm-up) */
 	/* audio sync via the source's sync offset (OBS buffers the audio for us) */
 	bool sync_owned = false;      /* we currently manage the parent's sync offset */
+	obs_weak_source_t *sync_parent = nullptr; /* parent we took sync from; weak ref kept
+		* so we can still restore after libobs detaches the filter (delete / Undo
+		* restore_filters clears filter_parent before our destroy runs) */
 	int64_t saved_sync = 0;       /* user's sync offset, restored on disable/destroy */
 	int64_t applied_extra = -1;   /* audio delay we last applied (ns); -1 = none */
 };
@@ -250,14 +253,29 @@ static void ensure_delay_ring(real3d_filter *f, uint32_t w, uint32_t h, int slot
 }
 
 /* Restore the parent source's audio sync offset we took over. Safe to call when
- * we don't own it (no-op). */
+ * we don't own it (no-op). Only called on the graphics thread (render / tick) or
+ * from destroy (no concurrent render), so touching render-owned ring/commit
+ * state here is race-free. */
 static void release_audio_sync(real3d_filter *f)
 {
 	if (!f->sync_owned)
 		return;
+	/* Prefer the live attachment; fall back to the weak ref kept at acquire.
+	 * A plain filter delete and Undo (obs_source_restore_filters) both clear
+	 * filter_parent before our destroy runs, so without the weak ref we could no
+	 * longer reach the parent to hand its offset back -- the offset would leak. */
 	obs_source_t *parent = obs_filter_get_parent(f->context);
+	obs_source_t *from_weak = nullptr;
+	if (!parent && f->sync_parent)
+		parent = from_weak = obs_weak_source_get_source(f->sync_parent);
 	if (parent)
 		obs_source_set_sync_offset(parent, f->saved_sync);
+	if (from_weak)
+		obs_source_release(from_weak);
+	if (f->sync_parent) {
+		obs_weak_source_release(f->sync_parent);
+		f->sync_parent = nullptr;
+	}
 	f->sync_owned = false;
 	f->applied_extra = -1;
 	f->commit_delay = -1;
@@ -968,6 +986,10 @@ static void real3d_video_render(void *data, gs_effect_t *)
 				if (parent) {
 					f->saved_sync =
 						obs_source_get_sync_offset(parent);
+					/* keep a weak ref so we can still restore after
+					 * libobs detaches us (delete / Undo) */
+					f->sync_parent =
+						obs_source_get_weak_source(parent);
 					f->sync_owned = true;
 					f->applied_extra = -1;
 				}
@@ -1144,17 +1166,6 @@ static void real3d_video_tick(void *data, float)
 		release_audio_sync(f);
 }
 
-/* Called when the filter is removed from its source, while the parent is still
- * attached (libobs clears filter_parent right after this). destroy() can run
- * later, by which point obs_filter_get_parent() is null and release_audio_sync()
- * could no longer restore the offset -- so deleting an *active* delay-mode filter
- * would leave the parent's audio delayed. Hand it back here. */
-static void real3d_filter_remove(void *data, obs_source_t *)
-{
-	auto *f = static_cast<real3d_filter *>(data);
-	release_audio_sync(f);
-}
-
 static struct obs_source_info real3d_filter_info = {};
 
 bool obs_module_load(void)
@@ -1175,7 +1186,6 @@ bool obs_module_load(void)
 	real3d_filter_info.get_height = real3d_get_height;
 	real3d_filter_info.video_render = real3d_video_render;
 	real3d_filter_info.video_tick = real3d_video_tick;
-	real3d_filter_info.filter_remove = real3d_filter_remove;
 	obs_register_source(&real3d_filter_info);
 	blog(LOG_INFO, "[near-real3d] loaded: %s (libobs %d.%d.%d)",
 	     REAL3D_BUILD_INFO, LIBOBS_API_MAJOR_VER, LIBOBS_API_MINOR_VER,
