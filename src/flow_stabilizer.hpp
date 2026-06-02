@@ -174,30 +174,30 @@ inline void maxFilter(std::vector<float> &im, int w, int h, int r)
  * cover the blur's footprint so the whole transition band feathers at full
  * strength (not just the one-pixel gradient spike), soften the weight boundary,
  * then blend the depth toward a blurred copy by that weight. */
-inline void edgeSoftenDepth(std::vector<float> &depth, int size, float sigma,
+inline void edgeSoftenDepth(std::vector<float> &depth, int w, int h, float sigma,
 			    float edge_lo, float edge_hi)
 {
 	if (sigma <= 0.f)
 		return;
-	const int n = size * size;
+	const int n = w * h;
 	if ((int)depth.size() != n || edge_hi <= edge_lo)
 		return;
 
-	std::vector<float> w((size_t)n);
+	std::vector<float> wt((size_t)n);
 	const float inv_span = 1.f / (edge_hi - edge_lo);
-	for (int y = 0; y < size; ++y)
-		for (int x = 0; x < size; ++x) {
+	for (int y = 0; y < h; ++y)
+		for (int x = 0; x < w; ++x) {
 			const int xm = x > 0 ? x - 1 : 0;
-			const int xp = x < size - 1 ? x + 1 : size - 1;
+			const int xp = x < w - 1 ? x + 1 : w - 1;
 			const int ym = y > 0 ? y - 1 : 0;
-			const int yp = y < size - 1 ? y + 1 : size - 1;
-			const float gx = 0.5f * (depth[(size_t)y * size + xp] -
-						 depth[(size_t)y * size + xm]);
-			const float gy = 0.5f * (depth[(size_t)yp * size + x] -
-						 depth[(size_t)ym * size + x]);
+			const int yp = y < h - 1 ? y + 1 : h - 1;
+			const float gx = 0.5f * (depth[(size_t)y * w + xp] -
+						 depth[(size_t)y * w + xm]);
+			const float gy = 0.5f * (depth[(size_t)yp * w + x] -
+						 depth[(size_t)ym * w + x]);
 			float t = (std::sqrt(gx * gx + gy * gy) - edge_lo) * inv_span;
 			t = t < 0.f ? 0.f : (t > 1.f ? 1.f : t);
-			w[(size_t)y * size + x] = t * t * (3.f - 2.f * t); /* smoothstep */
+			wt[(size_t)y * w + x] = t * t * (3.f - 2.f * t); /* smoothstep */
 		}
 
 	/* Dilate the weight across the blurred copy's *full* footprint
@@ -209,13 +209,13 @@ inline void edgeSoftenDepth(std::vector<float> &depth, int size, float sigma,
 	int r = (int)std::ceil(3.f * sigma);
 	if (r < 1)
 		r = 1;
-	maxFilter(w, size, size, r);            /* cover the feather band */
-	gaussianBlur(w, size, size, sigma * 0.5f); /* soften the weight boundary */
+	maxFilter(wt, w, h, r);            /* cover the feather band */
+	gaussianBlur(wt, w, h, sigma * 0.5f); /* soften the weight boundary */
 
 	std::vector<float> blurred = depth;
-	gaussianBlur(blurred, size, size, sigma);
+	gaussianBlur(blurred, w, h, sigma);
 	for (int i = 0; i < n; ++i) {
-		float ww = w[i] < 0.f ? 0.f : (w[i] > 1.f ? 1.f : w[i]);
+		float ww = wt[i] < 0.f ? 0.f : (wt[i] > 1.f ? 1.f : wt[i]);
 		depth[i] += ww * (blurred[i] - depth[i]);
 	}
 }
@@ -223,40 +223,40 @@ inline void edgeSoftenDepth(std::vector<float> &depth, int size, float sigma,
 /* Clamp history to the range represented by the current 3x3 neighbourhood.
  * This removes stale foreground depth where an object has already moved away. */
 inline void clipHistory3x3(const std::vector<float> &cur,
-			   const std::vector<float> &history, int size,
+			   const std::vector<float> &history, int w, int h,
 			   std::vector<float> &clipped)
 {
 	clipped.resize(history.size());
-	for (int y = 0; y < size; ++y)
-		for (int x = 0; x < size; ++x) {
-			float lo = cur[(size_t)y * size + x];
+	for (int y = 0; y < h; ++y)
+		for (int x = 0; x < w; ++x) {
+			float lo = cur[(size_t)y * w + x];
 			float hi = lo;
 			for (int dy = -1; dy <= 1; ++dy)
 				for (int dx = -1; dx <= 1; ++dx) {
-					const int xx = std::clamp(x + dx, 0, size - 1);
-					const int yy = std::clamp(y + dy, 0, size - 1);
-					const float v = cur[(size_t)yy * size + xx];
+					const int xx = std::clamp(x + dx, 0, w - 1);
+					const int yy = std::clamp(y + dy, 0, h - 1);
+					const float v = cur[(size_t)yy * w + xx];
 					lo = std::min(lo, v);
 					hi = std::max(hi, v);
 				}
-			const size_t i = (size_t)y * size + x;
+			const size_t i = (size_t)y * w + x;
 			clipped[i] = std::clamp(history[i], lo, hi);
 		}
 }
 
 /* Expand unreliable-history pixels to cover antialiased / softened edges. */
-inline void dilateMask(std::vector<uint8_t> &mask, int size, int radius)
+inline void dilateMask(std::vector<uint8_t> &mask, int w, int h, int radius)
 {
 	const std::vector<uint8_t> src = mask;
-	for (int y = 0; y < size; ++y)
-		for (int x = 0; x < size; ++x) {
-			if (!src[(size_t)y * size + x])
+	for (int y = 0; y < h; ++y)
+		for (int x = 0; x < w; ++x) {
+			if (!src[(size_t)y * w + x])
 				continue;
 			for (int dy = -radius; dy <= radius; ++dy)
 				for (int dx = -radius; dx <= radius; ++dx) {
-					const int xx = std::clamp(x + dx, 0, size - 1);
-					const int yy = std::clamp(y + dy, 0, size - 1);
-					mask[(size_t)yy * size + xx] = 1;
+					const int xx = std::clamp(x + dx, 0, w - 1);
+					const int yy = std::clamp(y + dy, 0, h - 1);
+					mask[(size_t)yy * w + xx] = 1;
 				}
 		}
 }
@@ -265,16 +265,16 @@ inline void dilateMask(std::vector<uint8_t> &mask, int size, int radius)
  * smooths compression banding / block noise so the depth model doesn't read
  * tone jumps as depth steps. Reuses the separable Gaussian above. The visible
  * warp samples the full-res frame, so this never softens the output image. */
-inline void smoothRGBA(uint8_t *rgba, int size, float sigma)
+inline void smoothRGBA(uint8_t *rgba, int w, int h, float sigma)
 {
 	if (sigma <= 0.f)
 		return;
-	const int n = size * size;
+	const int n = w * h;
 	std::vector<float> ch((size_t)n);
 	for (int c = 0; c < 3; ++c) { /* R,G,B; leave alpha */
 		for (int i = 0; i < n; ++i)
 			ch[i] = (float)rgba[(size_t)i * 4 + c];
-		gaussianBlur(ch, size, size, sigma);
+		gaussianBlur(ch, w, h, sigma);
 		for (int i = 0; i < n; ++i) {
 			float v = ch[i] + 0.5f;
 			rgba[(size_t)i * 4 + c] =
@@ -284,9 +284,10 @@ inline void smoothRGBA(uint8_t *rgba, int size, float sigma)
 }
 
 /* Dense pyramidal Lucas-Kanade. Returns flow (u,v) such that
- * prev(x) ~= cur(x + (u,v)); i.e. cur(X) ~= prev(X - (u,v)). Square `size`. */
+ * prev(x) ~= cur(x + (u,v)); i.e. cur(X) ~= prev(X - (u,v)). Frame is width x
+ * height (each pyramid axis is halved independently). */
 inline void denseFlowLK(const std::vector<float> &prev,
-			const std::vector<float> &cur, int size,
+			const std::vector<float> &cur, int width, int height,
 			std::vector<float> &u, std::vector<float> &v)
 {
 	const int LEVELS = 3, ITERS = 3, R = 5;
@@ -294,35 +295,38 @@ inline void denseFlowLK(const std::vector<float> &prev,
 
 	/* build prev/cur pyramids, coarsest last */
 	std::vector<std::vector<float>> pp{prev}, cp{cur};
-	std::vector<int> dim{size};
+	std::vector<int> dimW{width}, dimH{height};
 	for (int l = 1; l < LEVELS; ++l) {
 		std::vector<float> dp, dc;
 		int dw, dh;
-		downsample2(pp.back(), dim.back(), dim.back(), dp, dw, dh);
-		downsample2(cp.back(), dim.back(), dim.back(), dc, dw, dh);
+		downsample2(pp.back(), dimW.back(), dimH.back(), dp, dw, dh);
+		downsample2(cp.back(), dimW.back(), dimH.back(), dc, dw, dh);
 		pp.push_back(std::move(dp));
 		cp.push_back(std::move(dc));
-		dim.push_back(dw);
+		dimW.push_back(dw);
+		dimH.push_back(dh);
 	}
 
-	int cw = dim.back();
-	u.assign((size_t)cw * cw, 0.f);
-	v.assign((size_t)cw * cw, 0.f);
+	int cw = dimW.back(), ch = dimH.back();
+	u.assign((size_t)cw * ch, 0.f);
+	v.assign((size_t)cw * ch, 0.f);
 
 	for (int l = LEVELS - 1; l >= 0; --l) {
-		const int w = dim[l], n = w * w;
-		if (w != cw) { /* upsample flow from coarser level, scale x2 */
+		const int w = dimW[l], h = dimH[l], n = w * h;
+		if (w != cw || h != ch) { /* upsample flow from coarser level, scale x2 */
 			std::vector<float> nu((size_t)n), nv((size_t)n);
-			const float s = (float)cw / (float)w; /* ~0.5 */
-			for (int y = 0; y < w; ++y)
+			const float sx_ = (float)cw / (float)w; /* ~0.5 */
+			const float sy_ = (float)ch / (float)h; /* ~0.5 */
+			for (int y = 0; y < h; ++y)
 				for (int x = 0; x < w; ++x) {
-					float sx = x * s, sy = y * s;
-					nu[y * w + x] = 2.f * bilinear(u, cw, cw, sx, sy);
-					nv[y * w + x] = 2.f * bilinear(v, cw, cw, sx, sy);
+					float sx = x * sx_, sy = y * sy_;
+					nu[(size_t)y * w + x] = 2.f * bilinear(u, cw, ch, sx, sy);
+					nv[(size_t)y * w + x] = 2.f * bilinear(v, cw, ch, sx, sy);
 				}
 			u.swap(nu);
 			v.swap(nv);
 			cw = w;
+			ch = h;
 		}
 
 		/* cur gradients at this level (central diff) */
@@ -330,10 +334,10 @@ inline void denseFlowLK(const std::vector<float> &prev,
 		const std::vector<float> &pl_ = pp[l];
 		std::vector<float> gx((size_t)n), gy((size_t)n);
 		auto cix = [&](int x, int y) { return cl_[(size_t)y * w + x]; };
-		for (int y = 0; y < w; ++y)
+		for (int y = 0; y < h; ++y)
 			for (int x = 0; x < w; ++x) {
 				int xm = x > 0 ? x - 1 : 0, xp = x < w - 1 ? x + 1 : w - 1;
-				int ym = y > 0 ? y - 1 : 0, yp = y < w - 1 ? y + 1 : w - 1;
+				int ym = y > 0 ? y - 1 : 0, yp = y < h - 1 ? y + 1 : h - 1;
 				gx[(size_t)y * w + x] = 0.5f * (cix(xp, y) - cix(xm, y));
 				gy[(size_t)y * w + x] = 0.5f * (cix(x, yp) - cix(x, ym));
 			}
@@ -341,13 +345,13 @@ inline void denseFlowLK(const std::vector<float> &prev,
 		for (int it = 0; it < ITERS; ++it) {
 			std::vector<float> Gxx((size_t)n), Gyy((size_t)n),
 				Gxy((size_t)n), Bx((size_t)n), By((size_t)n);
-			for (int y = 0; y < w; ++y)
+			for (int y = 0; y < h; ++y)
 				for (int x = 0; x < w; ++x) {
 					const size_t i = (size_t)y * w + x;
 					const float px = x + u[i], py = y + v[i];
-					const float Jw = bilinear(cl_, w, w, px, py);
-					const float gxv = bilinear(gx, w, w, px, py);
-					const float gyv = bilinear(gy, w, w, px, py);
+					const float Jw = bilinear(cl_, w, h, px, py);
+					const float gxv = bilinear(gx, w, h, px, py);
+					const float gyv = bilinear(gy, w, h, px, py);
 					const float It = Jw - pl_[i];
 					Gxx[i] = gxv * gxv;
 					Gyy[i] = gyv * gyv;
@@ -355,11 +359,11 @@ inline void denseFlowLK(const std::vector<float> &prev,
 					Bx[i] = gxv * It;
 					By[i] = gyv * It;
 				}
-			boxSum(Gxx, w, w, R);
-			boxSum(Gyy, w, w, R);
-			boxSum(Gxy, w, w, R);
-			boxSum(Bx, w, w, R);
-			boxSum(By, w, w, R);
+			boxSum(Gxx, w, h, R);
+			boxSum(Gyy, w, h, R);
+			boxSum(Gxy, w, h, R);
+			boxSum(Bx, w, h, R);
+			boxSum(By, w, h, R);
 			for (size_t i = 0; i < (size_t)n; ++i) {
 				const float a = Gxx[i] + LAMBDA, dd = Gyy[i] + LAMBDA,
 					    b = Gxy[i];
@@ -388,16 +392,16 @@ enum class TemporalMode {
 
 class FlowStabilizer {
 public:
-	/* rgba: size*size*4 tight (current frame, RGBA8).
-	 * raw: size*size raw inverse depth (higher = nearer) from the model.
-	 * out: size*size stabilised, normalised depth in [0,1].
+	/* rgba: w*h*4 tight (current frame, RGBA8).
+	 * raw: w*h raw inverse depth (higher = nearer) from the model.
+	 * out: w*h stabilised, normalised depth in [0,1].
 	 * strength 0..1 (higher = steadier); smooth_sigma >=0 edge softening. */
-	void process(const uint8_t *rgba, int size, const std::vector<float> &raw,
+	void process(const uint8_t *rgba, int w, int h, const std::vector<float> &raw,
 		     std::vector<float> &out, bool enabled, TemporalMode mode,
 		     float strength,
 		     float smooth_sigma)
 	{
-		const int n = size * size;
+		const int n = w * h;
 
 		/* grayscale (Rec.601 luma, 0..255) */
 		std::vector<float> gray((size_t)n);
@@ -450,7 +454,7 @@ public:
 			out = cur;
 		} else {
 			std::vector<float> u, vv;
-			nr3d::denseFlowLK(prev_gray_, gray, size, u, vv);
+			nr3d::denseFlowLK(prev_gray_, gray, w, h, u, vv);
 
 			/* backward-warp prev depth AND prev gray into current alignment:
 			 * warped(X) = prev(X - flow). The flow-compensated gray residual
@@ -459,18 +463,18 @@ public:
 			 * when the *depth* residual is small (low depth-contrast movers,
 			 * e.g. a waved stick over a similar-depth background). */
 			std::vector<float> warped((size_t)n), wgray((size_t)n);
-			for (int y = 0; y < size; ++y)
-				for (int x = 0; x < size; ++x) {
-					const size_t i = (size_t)y * size + x;
+			for (int y = 0; y < h; ++y)
+				for (int x = 0; x < w; ++x) {
+					const size_t i = (size_t)y * w + x;
 					const float sx = x - u[i], sy = y - vv[i];
-					warped[i] = nr3d::bilinear(prev_depth_, size, size, sx, sy);
-					wgray[i] = nr3d::bilinear(prev_gray_, size, size, sx, sy);
+					warped[i] = nr3d::bilinear(prev_depth_, w, h, sx, sy);
+					wgray[i] = nr3d::bilinear(prev_gray_, w, h, sx, sy);
 				}
 
 			const std::vector<float> *history = &warped;
 			std::vector<float> clipped_history;
 			if (mode != TemporalMode::Legacy) {
-				nr3d::clipHistory3x3(cur, warped, size, clipped_history);
+				nr3d::clipHistory3x3(cur, warped, w, h, clipped_history);
 				history = &clipped_history;
 			}
 
@@ -487,7 +491,7 @@ public:
 					    direct > REACTIVE_DIRECT)
 						reactive[i] = 1;
 				}
-				nr3d::dilateMask(reactive, size, REACTIVE_DILATE);
+				nr3d::dilateMask(reactive, w, h, REACTIVE_DILATE);
 			}
 
 			float s = strength < 0.f ? 0.f
@@ -520,7 +524,7 @@ public:
 		 * regions keep their full depth detail (a global blur rounded off the
 		 * whole 3D and bled the foreground outward). */
 		if (smooth_sigma > 0.f && (int)out.size() == n)
-			nr3d::edgeSoftenDepth(out, size, smooth_sigma, EDGE_LO,
+			nr3d::edgeSoftenDepth(out, w, h, smooth_sigma, EDGE_LO,
 					      EDGE_HI);
 	}
 

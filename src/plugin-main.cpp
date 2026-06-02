@@ -50,12 +50,16 @@ MODULE_EXPORT const char *obs_module_description(void)
 }
 
 static const float STRENGTH_FRAC[5] = {0.0f, 0.010f, 0.018f, 0.028f, 0.045f};
-static const int INFER_SIZE = 392; /* must match the exported ONNX input size */
+/* Depth inference input dims (W x H), must match the exported ONNX. Square 392
+ * today; a 16:9 model (e.g. 448x252) just changes these two constants and the
+ * model file -- the whole inference path below is dimension-general. */
+static const int INFER_W = 392;
+static const int INFER_H = 392;
 /* After motion stops, keep inferring this many "settle" frames so the temporal
  * blend converges to its ghost-free steady state before the static-skip freezes
  * the depth (otherwise a motion trail / post-cut ghost gets frozen in). */
 static const int SETTLE_FRAMES = 8;
-/* Mild Gaussian applied to the 392^2 inference input when "smooth input" is on,
+/* Mild Gaussian applied to the INFER_W*INFER_H inference input when "smooth input" is on,
  * to tame compression banding before depth inference (output is unaffected). */
 static const float INPUT_SMOOTH_SIGMA = 0.8f;
 
@@ -117,11 +121,11 @@ struct real3d_filter {
 
 	gs_texrender_t *rt_full = nullptr;  /* captured input at WxH */
 	gs_texrender_t *rt_pre[2] = {nullptr, nullptr}; /* ping-pong halving pyramid */
-	gs_texrender_t *rt_small = nullptr; /* downscaled to INFER_SIZE^2 */
+	gs_texrender_t *rt_small = nullptr; /* downscaled to INFER_W*INFER_H */
 	gs_stagesurf_t *stage[2] = {nullptr, nullptr}; /* GPU->CPU readback, ping-pong */
 	int stage_cur = 0;             /* surface staged this tick; map the other */
 	bool stage_primed = false;     /* false until both surfaces hold a frame */
-	gs_texture_t *depth_tex = nullptr;  /* INFER_SIZE^2 R32F */
+	gs_texture_t *depth_tex = nullptr;  /* INFER_W*INFER_H R32F */
 
 	/* tunables -- written by real3d_update (UI thread), read on the graphics
 	 * thread (render / inference / size queries). Atomic (relaxed) since there
@@ -144,8 +148,8 @@ struct real3d_filter {
 	std::thread worker;
 	std::mutex m;
 	std::condition_variable cv;
-	std::vector<uint8_t> in_buf;   /* INFER_SIZE^2 * 4 RGBA, tight */
-	std::vector<float> depth_buf;  /* INFER_SIZE^2 */
+	std::vector<uint8_t> in_buf;   /* INFER_W*INFER_H * 4 RGBA, tight */
+	std::vector<float> depth_buf;  /* INFER_W*INFER_H */
 	bool input_ready = false, depth_ready = false, stop = false;
 	uint32_t in_gen = 0;           /* (m) scene-cut generation of in_buf's frame */
 	uint32_t out_gen = 0;          /* (m) generation depth_buf was computed for */
@@ -156,8 +160,8 @@ struct real3d_filter {
 
 	/* static-frame skip: when the downscaled input barely changes we reuse
 	 * the depth already in depth_tex instead of re-running ONNX */
-	std::vector<uint8_t> readback; /* reused INFER_SIZE^2*4 readback scratch (graphics thread) */
-	std::vector<uint8_t> prev_in; /* last *inferred* INFER_SIZE^2*4 frame */
+	std::vector<uint8_t> readback; /* reused INFER_W*INFER_H*4 readback scratch (graphics thread) */
+	std::vector<uint8_t> prev_in; /* last *inferred* INFER_W*INFER_H*4 frame */
 	std::atomic<bool> skip_static{true};       /* UI thread writes, graphics reads */
 	std::atomic<float> static_thresh{1.0f};    /* mean abs RGB diff (0-255); 0 = exact */
 	int settle_left = 0;          /* remaining settle inferences after motion */
@@ -281,14 +285,15 @@ static void worker_fn(real3d_filter *f)
 		else
 			flow_in.clear();
 		if (input_smooth)
-			nr3d::smoothRGBA(local_in.data(), f->ort.size(),
-					 INPUT_SMOOTH_SIGMA);
+			nr3d::smoothRGBA(local_in.data(), f->ort.width(),
+					 f->ort.height(), INPUT_SMOOTH_SIGMA);
 
 		/* raw ONNX depth -> normalise + flow-guided temporal stabilise */
 		if (f->ort.Run(local_in.data(), raw)) {
 			f->flow.process(
 				flow_in.empty() ? local_in.data() : flow_in.data(),
-				f->ort.size(), raw, stab, temporal, temporal_mode,
+				f->ort.width(), f->ort.height(), raw, stab,
+				temporal, temporal_mode,
 				f->ort.stab_strength.load(std::memory_order_relaxed),
 				f->ort.depth_smooth.load(std::memory_order_relaxed) * 6.0f);
 			{
@@ -386,17 +391,17 @@ static void *real3d_create(obs_data_t *settings, obs_source_t *context)
 	f->rt_pre[0] = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
 	f->rt_pre[1] = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
 	f->rt_small = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
-	f->stage[0] = gs_stagesurface_create(INFER_SIZE, INFER_SIZE, GS_RGBA);
-	f->stage[1] = gs_stagesurface_create(INFER_SIZE, INFER_SIZE, GS_RGBA);
-	std::vector<float> half(INFER_SIZE * INFER_SIZE, 0.5f);
-	f->depth_tex = gs_texture_create(INFER_SIZE, INFER_SIZE, GS_R32F, 1,
+	f->stage[0] = gs_stagesurface_create(INFER_W, INFER_H, GS_RGBA);
+	f->stage[1] = gs_stagesurface_create(INFER_W, INFER_H, GS_RGBA);
+	std::vector<float> half((size_t)INFER_W * INFER_H, 0.5f);
+	f->depth_tex = gs_texture_create(INFER_W, INFER_H, GS_R32F, 1,
 					 nullptr, GS_DYNAMIC);
 	gs_texture_set_image(f->depth_tex, (const uint8_t *)half.data(),
-			     INFER_SIZE * sizeof(float), false);
+			     INFER_W * sizeof(float), false);
 	obs_leave_graphics();
 
 	if (model_path) {
-		f->ort_ok = f->ort.Init(utf8_to_wide(model_path), INFER_SIZE);
+		f->ort_ok = f->ort.Init(utf8_to_wide(model_path), INFER_W, INFER_H);
 		if (!f->ort_ok)
 			blog(LOG_WARNING, "[near-real3d] ONNX init failed (%s) "
 					  "-> luminance-depth fallback",
@@ -667,31 +672,31 @@ static void maybe_submit_inference(real3d_filter *f, gs_texture_t *full)
 		return;
 	f->last_detect_ns = now;
 
-	/* Area-average downscale to the square inference size via a progressive 2:1
-	 * halving pyramid (a hand-rolled mipmap; libobs exposes no runtime mip-gen
-	 * and texrender can't mip). A single steep bilinear reduction only reads a
-	 * 2x2 footprint, so reducing by more than 2:1 (e.g. a 1920/4K source -> 784
-	 * in one step) under-samples and lets aliasing + compression banding through.
-	 * Halving repeatedly box-averages the whole footprint instead; the last step
-	 * squishes to INFER_SIZE^2, by which point each axis reduces by <=~2:1 so the
-	 * 2x2 bilinear tap is sufficient. Inference path only -- the visible warp
-	 * still samples the full-res frame, so output sharpness is unaffected. */
+	/* Area-average downscale to the inference size (INFER_W x INFER_H) via a
+	 * progressive 2:1 halving pyramid (a hand-rolled mipmap; libobs exposes no
+	 * runtime mip-gen and texrender can't mip). A single steep bilinear reduction
+	 * only reads a 2x2 footprint, so reducing by more than 2:1 (e.g. a 1920/4K
+	 * source in one step) under-samples and lets aliasing + compression banding
+	 * through. Halving repeatedly box-averages the whole footprint instead; the
+	 * last step reduces to INFER_W x INFER_H, by which point each axis reduces by
+	 * <=~2:1 so the 2x2 bilinear tap is sufficient. Inference path only -- the
+	 * visible warp still samples the full-res frame, so sharpness is unaffected. */
 	gs_effect_t *def = obs_get_base_effect(OBS_EFFECT_DEFAULT);
 	gs_eparam_t *dimg = gs_effect_get_param_by_name(def, "image");
 	struct vec4 clr;
 	vec4_zero(&clr);
-	const uint32_t PRE = INFER_SIZE * 2;
+	const uint32_t PRE_W = INFER_W * 2, PRE_H = INFER_H * 2;
 
 	gs_texture_t *src = full;
 	uint32_t cw = gs_texture_get_width(full);
 	uint32_t ch = gs_texture_get_height(full);
 	int pp = 0; /* ping-pong index into rt_pre[] */
-	while (cw > PRE || ch > PRE) {
-		/* Halve each axis independently, only while it still exceeds PRE, so a
-		 * wide/ultrawide source doesn't over-shrink its short axis (which would
-		 * needlessly drop vertical depth detail before the final square step). */
-		const uint32_t nw = cw > PRE ? (cw + 1) / 2 : cw;
-		const uint32_t nh = ch > PRE ? (ch + 1) / 2 : ch;
+	while (cw > PRE_W || ch > PRE_H) {
+		/* Halve each axis independently, only while it still exceeds 2x its
+		 * inference target, so a wide/ultrawide source doesn't over-shrink its
+		 * short axis before the final reduction. */
+		const uint32_t nw = cw > PRE_W ? (cw + 1) / 2 : cw;
+		const uint32_t nh = ch > PRE_H ? (ch + 1) / 2 : ch;
 		gs_texrender_t *dst = f->rt_pre[pp];
 		gs_texrender_reset(dst);
 		if (!gs_texrender_begin(dst, nw, nh))
@@ -709,13 +714,13 @@ static void maybe_submit_inference(real3d_filter *f, gs_texture_t *full)
 	}
 
 	gs_texrender_reset(f->rt_small);
-	if (!gs_texrender_begin(f->rt_small, INFER_SIZE, INFER_SIZE))
+	if (!gs_texrender_begin(f->rt_small, INFER_W, INFER_H))
 		return;
 	gs_clear(GS_CLEAR_COLOR, &clr, 0.0f, 0);
-	gs_ortho(0.0f, (float)INFER_SIZE, 0.0f, (float)INFER_SIZE, -100.0f, 100.0f);
+	gs_ortho(0.0f, (float)INFER_W, 0.0f, (float)INFER_H, -100.0f, 100.0f);
 	gs_effect_set_texture(dimg, src);
 	while (gs_effect_loop(def, "Draw"))
-		gs_draw_sprite(src, 0, INFER_SIZE, INFER_SIZE);
+		gs_draw_sprite(src, 0, INFER_W, INFER_H);
 	gs_texrender_end(f->rt_small);
 
 	/* Double-buffered GPU->CPU readback: stage this frame into one surface and
@@ -741,12 +746,12 @@ static void maybe_submit_inference(real3d_filter *f, gs_texture_t *full)
 	 * no-op once the capacity is established, so the per-frame readback fill no
 	 * longer churns the heap on the graphics thread (this runs every tick, even
 	 * while static-skipping). */
-	f->readback.resize((size_t)INFER_SIZE * INFER_SIZE * 4);
+	f->readback.resize((size_t)INFER_W * INFER_H * 4);
 	std::vector<uint8_t> &tight = f->readback;
-	for (int y = 0; y < INFER_SIZE; ++y)
-		memcpy(&tight[(size_t)y * INFER_SIZE * 4],
+	for (int y = 0; y < INFER_H; ++y)
+		memcpy(&tight[(size_t)y * INFER_W * 4],
 		       data + (size_t)y * linesize,
-		       (size_t)INFER_SIZE * 4);
+		       (size_t)INFER_W * 4);
 	gs_stagesurface_unmap(readback);
 
 	/* Hard-cut detection: large mean abs RGB diff vs the previous sampled frame.
@@ -881,7 +886,7 @@ static void real3d_video_render(void *data, gs_effect_t *)
 		if (!got.empty()) {
 			gs_texture_set_image(f->depth_tex,
 					     (const uint8_t *)got.data(),
-					     INFER_SIZE * sizeof(float), false);
+					     INFER_W * sizeof(float), false);
 			/* Record which scene this depth belongs to. The warp trusts the
 			 * depth (lets the disparity ramp back) once the frame being shown
 			 * is no newer than depth_gen; a stale pre-cut result is uploaded
@@ -904,7 +909,7 @@ static void real3d_video_render(void *data, gs_effect_t *)
 				f->logged_first_depth = true;
 				blog(LOG_INFO, "[near-real3d] first ONNX depth "
 					       "uploaded (%dx%d) - inference loop live",
-				     INFER_SIZE, INFER_SIZE);
+				     INFER_W, INFER_H);
 			}
 		}
 	}

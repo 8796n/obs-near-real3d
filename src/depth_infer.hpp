@@ -23,7 +23,7 @@
 
 class OrtDepth {
 public:
-	bool Init(const std::wstring &model_path, int size)
+	bool Init(const std::wstring &model_path, int w, int h)
 	{
 		try {
 			Ort::SessionOptions so;
@@ -33,9 +33,10 @@ public:
 			Ort::ThrowOnError(
 				OrtSessionOptionsAppendExecutionProvider_DML(so, 0));
 			session_ = Ort::Session(env_, model_path.c_str(), so);
-			size_ = size;
-			in_.resize((size_t)3 * size * size);
-			in_shape_ = {1, 3, size, size};
+			w_ = w;
+			h_ = h;
+			in_.resize((size_t)3 * w * h);
+			in_shape_ = {1, 3, h, w}; /* NCHW */
 			return true;
 		} catch (const std::exception &e) {
 			last_error_ = e.what();
@@ -43,7 +44,8 @@ public:
 		}
 	}
 
-	int size() const { return size_; }
+	int width() const { return w_; }
+	int height() const { return h_; }
 	const std::string &last_error() const { return last_error_; }
 
 	std::atomic<bool> temporal{true};      /* temporal stabilisation on/off */
@@ -51,12 +53,12 @@ public:
 	std::atomic<float> stab_strength{0.4f}; /* 0 = none .. 1 = heavy smoothing */
 	std::atomic<float> depth_smooth{0.3f}; /* 0..1 -> depth edge-softening sigma */
 
-	/* rgba: size*size*4 tightly packed (R,G,B,A). out: size*size in [0,1]. */
+	/* rgba: w*h*4 tightly packed (R,G,B,A). out: w*h in [0,1]. */
 	bool Run(const uint8_t *rgba, std::vector<float> &out)
 	{
 		static const float mean[3] = {0.485f, 0.456f, 0.406f};
 		static const float istd[3] = {1.f / 0.229f, 1.f / 0.224f, 1.f / 0.225f};
-		const int n = size_ * size_;
+		const int n = w_ * h_;
 		float *r = in_.data(), *g = r + n, *b = g + n;
 		for (int i = 0; i < n; ++i) {
 			const uint8_t *p = rgba + (size_t)i * 4;
@@ -84,7 +86,7 @@ public:
 			}
 			if (ti.GetElementCount() != (size_t)n) {
 				last_error_ = "unexpected depth element count "
-					      "(model size != INFER_SIZE?)";
+					      "(model size != INFER_W*INFER_H?)";
 				return false;
 			}
 			/* raw inverse depth; normalisation + temporal stabilisation +
@@ -102,7 +104,7 @@ public:
 private:
 	Ort::Env env_{ORT_LOGGING_LEVEL_WARNING, "obs-near-real3d"};
 	Ort::Session session_{nullptr};
-	int size_ = 0;
+	int w_ = 0, h_ = 0;
 	std::vector<float> in_;
 	std::array<int64_t, 4> in_shape_{};
 	std::string last_error_;
