@@ -1,9 +1,9 @@
 name: release
 
-# Push a tag like v0.1.0 to build + publish a release. (Manual runs build the
+# Push a tag like v0.2.0 to build + publish a release. (Manual runs build the
 # artifacts but don't publish.) The baked-in version comes from the tag
-# unchanged (v0.1.5 -> v0.1.5); for manual runs it falls back to
-# 0.1.<run_number>.
+# unchanged (v0.2.0 -> v0.2.0); for manual runs it falls back to
+# 0.2.<run_number>.
 on:
   push:
     tags: ["v*"]
@@ -29,7 +29,7 @@ jobs:
         run: |
           $tag = $env:REF_NAME
           if ($tag -match '^v\d+\.\d+\.\d+.*$') { $v = $tag }
-          else { $v = "0.1.$env:RUN_NUMBER" }
+          else { $v = "0.2.$env:RUN_NUMBER" }
           "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "version = $v"
 
