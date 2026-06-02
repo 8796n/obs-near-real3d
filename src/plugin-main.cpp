@@ -1014,18 +1014,19 @@ static void real3d_video_render(void *data, gs_effect_t *)
 		}
 	}
 
-	/* Scene-cut disparity fade. Flatten to 2D while the frame we are about to
-	 * warp (shown_gen) is from a newer scene than the depth we hold (depth_gen),
-	 * i.e. its matching depth hasn't arrived yet -- warping it with the previous
-	 * scene's depth is the glitch we are avoiding. Once depth catches up, ramp
-	 * back to full over ~1/DISP_RAMP_PER_SEC s so the 3D returns without a pop.
-	 * Comparing the *displayed* generation makes this correct in delay mode: the
-	 * hold starts when the post-cut frame actually reaches the screen and lifts
-	 * when its depth lands, instead of flattening the still-valid old-scene tail.
-	 * A failsafe lifts the hold if the matching depth never arrives (e.g.
-	 * inference failure) so the filter can't get stuck flat. */
+	/* Scene-cut disparity fade. Flatten to 2D whenever the frame we are about to
+	 * warp (shown_gen) and the depth we hold (depth_gen) are from different
+	 * scenes -- warping across a cut is the glitch we are avoiding. depth_tex
+	 * holds only the latest depth, so a mismatch in *either* direction is unsafe:
+	 *   shown_gen > depth_gen : the post-cut frame's depth hasn't arrived yet.
+	 *   shown_gen < depth_gen : (delay mode) the forced post-cut inference landed
+	 *     the next scene's depth while the ring is still showing the prior scene,
+	 *     and that scene's matching depth has already been overwritten.
+	 * Once the two line up, ramp back to full over ~1/DISP_RAMP_PER_SEC s so the
+	 * 3D returns without a pop. A failsafe lifts the hold if they never converge
+	 * (e.g. inference failure) so the filter can't get stuck flat. */
 	{
-		const bool depth_stale = shown_gen > f->depth_gen;
+		const bool depth_stale = shown_gen != f->depth_gen;
 		if (depth_stale) {
 			if (!f->stale_since_ns)
 				f->stale_since_ns = now;
