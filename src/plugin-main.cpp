@@ -82,6 +82,11 @@ static const float DISP_RAMP_PER_SEC = 6.0f; /* disparity fade-in after a cut (~
 /* Failsafe: release the flat hold even if no post-cut depth ever arrives (e.g.
  * inference failure / worker stall) so the filter can't get stuck flat. */
 static const uint64_t FLATTEN_TIMEOUT_NS = 500000000ULL;
+/* A render gap longer than this means video_render was paused (the filter was
+ * hidden/disabled), not just a slow frame. On resume we discard the delay
+ * pipeline's pre-pause state so a stale capture timestamp isn't measured as a
+ * giant inference latency. Far above any real frame interval (10 fps = 0.1 s). */
+static const uint64_t RESUME_GAP_NS = 500000000ULL;
 
 /* ---- frame-matched delay mode (optional) ----
  * The depth lags the image by the inference pipeline latency, so by default the
@@ -190,6 +195,7 @@ struct real3d_filter {
 	uint64_t staged_ts[2] = {0, 0}; /* capture ts paired with each staging surface */
 	double delay_ema_ns = 0.0;    /* measured pipeline latency (capture->depth), LPF */
 	bool delay_ema_init = false;
+	uint64_t latency_epoch_ns = 0; /* reject latency samples from captures before the last resume */
 	int commit_delay = -1;        /* committed delay in frames (drives video+audio); -1 = unset */
 	uint64_t last_commit_ns = 0;  /* throttles re-commits so audio offset stays steady */
 	std::vector<gs_texture_t *> ring; /* recent full-res frames (delay line) */
@@ -872,6 +878,15 @@ static void real3d_video_render(void *data, gs_effect_t *)
 	const uint64_t now = os_gettime_ns();
 	f->cur_capture_ns = now;
 
+	/* Resume after a hide/disable (video_render was paused): drop the delay
+	 * pipeline's pre-pause state. Otherwise a readback/worker result captured
+	 * before the pause would be measured as `now - got_ts` -- the whole pause --
+	 * and briefly slam the delay ring (and audio offset) to its cap. */
+	if (f->last_render_ns && now - f->last_render_ns > RESUME_GAP_NS) {
+		f->stage_primed = false;   /* re-prime; discard the pre-pause staged frame */
+		f->latency_epoch_ns = now; /* ignore latency from captures before now */
+	}
+
 	capture_input(f, w, h, space);
 	gs_texture_t *full = gs_texrender_get_texture(f->rt_full);
 	if (!full)
@@ -904,7 +919,8 @@ static void real3d_video_render(void *data, gs_effect_t *)
 			f->depth_gen = got_gen;
 			/* Measure the capture->depth pipeline latency (LPF). This is how
 			 * far the image must be delayed in sync mode to match the depth. */
-			if (got_ts && now > got_ts) {
+			if (got_ts && got_ts >= f->latency_epoch_ns &&
+			    now > got_ts) {
 				const double lat = (double)(now - got_ts);
 				if (!f->delay_ema_init) {
 					f->delay_ema_ns = lat;
