@@ -2,8 +2,8 @@
 # produce a portable ZIP and (if Inno Setup is present) an installer .exe.
 #
 # Run build.ps1 first (so build\obs-near-real3d.dll exists). Works locally and
-# in CI. Usage:  .\package.ps1 -Version 0.2.0
-param([string]$Version = "0.2.0-dev")
+# in CI. Usage:  .\package.ps1 -Version 0.2.2
+param([string]$Version = "0.2.2-dev")
 $ErrorActionPreference = "Stop"
 $SRC   = $PSScriptRoot
 $DIST  = Join-Path $SRC "dist"

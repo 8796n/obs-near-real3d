@@ -1,10 +1,10 @@
 ; Inno Setup script for near Real 3D (obs-near-real3d).
 ; Built by package.ps1 / CI. The staged plugin tree must exist at
 ;   ..\dist\stage\obs-near-real3d\{bin\64bit, data, ...}
-; Pass the version with:  ISCC.exe /DAppVersion=0.2.0 obs-near-real3d.iss
+; Pass the version with:  ISCC.exe /DAppVersion=0.2.2 obs-near-real3d.iss
 
 #ifndef AppVersion
-  #define AppVersion "0.2.0-dev"
+  #define AppVersion "0.2.2-dev"
 #endif
 
 [Setup]
