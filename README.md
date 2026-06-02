@@ -183,9 +183,9 @@ SBS 対応のグラス/ディスプレイへ送るなら、SBS 出力したシ�
 
 1. **一度だけ準備**: 深度モデル `depth_anything_v2_small.onnx` を安定した URL（GitHub Release アセット等）に置き、リポジトリの **Actions 変数**（Settings → Secrets and variables → Actions → Variables）に2つ設定。モデルは巨大なので Git には含めない。
    - `MODEL_URL` … モデルの直リンク
-   - `MODEL_SHA256` … モデルの SHA-256（**タグリリースでは必須**。未設定だと CI が失敗）。現行モデルの値:
-     `593878883CF16CA39A58895390A251F1BC2858B9C1256FC167E65DBBB230435D`
-     （`Get-FileHash depth_anything_v2_small.onnx -Algorithm SHA256` で確認可）
+   - `MODEL_SHA256` … モデルの SHA-256（**タグリリースでは必須**。未設定だと CI が失敗）。現行モデル（**448×252 / 16:9 / FP16**）の値:
+     `3C8DE7CCC0FAA9E266B6389628B9823412F25D995202AB58D9306A50A185CC5C`
+     （`Get-FileHash depth_anything_v2_small.onnx -Algorithm SHA256` で確認可。再生成は `tools/export_onnx.py --width 448 --height 252`）
 2. **リリース**: `v0.1.0` のような **タグを push** すると、CI が 依存取得 → `-DPLUGIN_VERSION=<タグ>` でビルド → `package.ps1` で ZIP＋インストーラ生成 → その Release に添付（バージョンはタグ由来。手動実行時は `0.1.<run_number>`）。
 3. **ローカルでも生成可**: `setup.ps1` → `build.ps1` → `package.ps1 -Version 0.1.0` で `dist/` に ZIP（＋Inno Setup があればインストーラ）。初回や CI 整備前の手動アップロードに。
 
