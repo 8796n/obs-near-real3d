@@ -1123,6 +1123,17 @@ static void real3d_video_tick(void *data, float)
 		release_audio_sync(f);
 }
 
+/* Called when the filter is removed from its source, while the parent is still
+ * attached (libobs clears filter_parent right after this). destroy() can run
+ * later, by which point obs_filter_get_parent() is null and release_audio_sync()
+ * could no longer restore the offset -- so deleting an *active* delay-mode filter
+ * would leave the parent's audio delayed. Hand it back here. */
+static void real3d_filter_remove(void *data, obs_source_t *)
+{
+	auto *f = static_cast<real3d_filter *>(data);
+	release_audio_sync(f);
+}
+
 static struct obs_source_info real3d_filter_info = {};
 
 bool obs_module_load(void)
@@ -1143,6 +1154,7 @@ bool obs_module_load(void)
 	real3d_filter_info.get_height = real3d_get_height;
 	real3d_filter_info.video_render = real3d_video_render;
 	real3d_filter_info.video_tick = real3d_video_tick;
+	real3d_filter_info.filter_remove = real3d_filter_remove;
 	obs_register_source(&real3d_filter_info);
 	blog(LOG_INFO, "[near-real3d] loaded: %s (libobs %d.%d.%d)",
 	     REAL3D_BUILD_INFO, LIBOBS_API_MAJOR_VER, LIBOBS_API_MINOR_VER,
