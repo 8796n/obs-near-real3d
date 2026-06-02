@@ -41,7 +41,7 @@ if ((-not (Test-Path "$ortRoot\lib\onnxruntime.lib")) -or
 } else { Write-Host "[3/4] onnxruntime present" }
 
 # 4. Depth model (prebuilt artifact, shipped with releases) --------------------
-# Depth Anything V2 Small exported to ONNX (392^2, FP16). Place the file at
+# Depth Anything V2 Small exported to ONNX (448x252, 16:9, FP16). Place the file at
 # models\depth_anything_v2_small.onnx (download it from the GitHub release).
 if (Test-Path "$SRC\models\depth_anything_v2_small.onnx") {
   Write-Host "[4/4] depth model present"
