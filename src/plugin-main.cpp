@@ -943,9 +943,13 @@ static void real3d_video_render(void *data, gs_effect_t *)
 			 * but the disparity stays flat until the matching depth lands. */
 			f->depth_gen = got_gen;
 			/* Measure the capture->depth pipeline latency (LPF). This is how
-			 * far the image must be delayed in sync mode to match the depth. */
-			if (got_ts && got_ts >= f->latency_epoch_ns &&
-			    now > got_ts) {
+			 * far the image must be delayed in sync mode to match the depth.
+			 * Only measure while sync delay is ON: the EMA is unused otherwise,
+			 * and measuring with it off lets a hide/resume from any duration
+			 * (which the tick reset and render-gap can't always cover when we
+			 * don't own sync) poison the value for a later enable. */
+			if (f->sync_delay.load(std::memory_order_relaxed) && got_ts &&
+			    got_ts >= f->latency_epoch_ns && now > got_ts) {
 				const double lat = (double)(now - got_ts);
 				if (!f->delay_ema_init) {
 					f->delay_ema_ns = lat;
