@@ -179,6 +179,8 @@ SBS 対応のグラス/ディスプレイへ送るなら、SBS 出力したシ�
 
 配布物は **GitHub Actions** が自動生成します（`.github/workflows/release.yml`）。
 
+> 深度モデルの生成は `tools/export_onnx.py`（Depth Anything V2 Small → ONNX、既定 FP16・固定 392²）。`python tools/export_onnx.py` で `models/depth_anything_v2_small.onnx` を再生成（要 torch/transformers/onnx、FP16 は CUDA）。入力は 14 の倍数なら矩形も可（`--width/--height`）。
+
 1. **一度だけ準備**: 深度モデル `depth_anything_v2_small.onnx` を安定した URL（GitHub Release アセット等）に置き、リポジトリの **Actions 変数**（Settings → Secrets and variables → Actions → Variables）に2つ設定。モデルは巨大なので Git には含めない。
    - `MODEL_URL` … モデルの直リンク
    - `MODEL_SHA256` … モデルの SHA-256（**タグリリースでは必須**。未設定だと CI が失敗）。現行モデルの値:

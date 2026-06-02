@@ -12,5 +12,7 @@ CMakeUserPresets.json
 *.user
 *.log
 .build.log
+__pycache__/
+*.pyc
 # Internal local handoff notes (Dropbox-synced; may contain local paths)
 NPU_PORT_HANDOFF.md
