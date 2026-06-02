@@ -1,0 +1,201 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-2.0-or-later
+     A/V sync test pattern for the near Real 3D "Frame-matched depth" mode.
+
+     A bright bar sweeps left->right and a short beep fires the instant the bar
+     crosses the centre line; a ring flashes there at the same moment, and the
+     scrolling strip at the bottom shows the real audio as periodic spikes.
+
+     At the SOURCE the beep and the bar-on-the-line coincide exactly (both are
+     driven by the Web Audio clock). So in OBS:
+       * filter OFF, or delay mode working correctly  -> bar is ON the centre
+         line (and the ring flashes) exactly when you HEAR the beep.
+       * video delayed but audio NOT (feature broken)  -> you hear the beep
+         while the bar is still LEFT of the line; read the gap on the ms ruler.
+
+     Use as an OBS Browser Source (Local file), tick "Control audio via OBS",
+     then add the near Real 3D filter and toggle Frame-matched depth.
+     Keys (when focused): Up/Down = beep period, Space = resume audio. -->
+<meta charset="utf-8">
+<title>A/V sync test</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #cv { display: block; }
+</style>
+<canvas id="cv"></canvas>
+<script>
+"use strict";
+const cv = document.getElementById("cv");
+const g = cv.getContext("2d");
+let W = 0, H = 0, dpr = 1;
+function resize() {
+  dpr = Math.max(1, window.devicePixelRatio || 1);
+  W = Math.floor(innerWidth);
+  H = Math.floor(innerHeight);
+  cv.width = Math.floor(W * dpr);
+  cv.height = Math.floor(H * dpr);
+  cv.style.width = W + "px";
+  cv.style.height = H + "px";
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+addEventListener("resize", resize);
+resize();
+
+// ---- audio: a beep at the centre of every PERIOD, scheduled on the audio clock
+let actx = null, master = null, analyser = null, td = null;
+let period = 1.0;            // seconds between beeps
+const BEEP_HZ = 1500, BEEP_LEN = 0.05;
+let nextBeep = 0;
+
+function initAudio() {
+  if (actx) return;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  actx = new AC();
+  master = actx.createGain();
+  master.gain.value = 0.22;
+  analyser = actx.createAnalyser();
+  analyser.fftSize = 2048;
+  td = new Float32Array(analyser.fftSize);
+  master.connect(analyser);
+  analyser.connect(actx.destination);
+  // first beep at the next (N + 0.5) * period boundary (bar at centre)
+  nextBeep = (Math.floor(actx.currentTime / period) + 0.5) * period;
+  if (nextBeep < actx.currentTime) nextBeep += period;
+}
+function resumeAudio() { if (actx && actx.state !== "running") actx.resume(); }
+
+function scheduleBeep(t) {
+  const o = actx.createOscillator(), e = actx.createGain();
+  o.type = "square";
+  o.frequency.value = BEEP_HZ;
+  o.connect(e); e.connect(master);
+  // short envelope so the click itself doesn't ring
+  e.gain.setValueAtTime(0, t);
+  e.gain.linearRampToValueAtTime(1, t + 0.002);
+  e.gain.setValueAtTime(1, t + BEEP_LEN - 0.006);
+  e.gain.linearRampToValueAtTime(0, t + BEEP_LEN);
+  o.start(t);
+  o.stop(t + BEEP_LEN + 0.02);
+}
+function scheduler() {
+  if (!actx || actx.state !== "running") return;
+  // re-anchor if period changed
+  if (nextBeep < actx.currentTime - period)
+    nextBeep = (Math.floor(actx.currentTime / period) + 0.5) * period;
+  while (nextBeep < actx.currentTime + 0.25) {
+    scheduleBeep(nextBeep);
+    nextBeep += period;
+  }
+}
+setInterval(scheduler, 25);
+
+// try to start without a gesture (OBS browser source / permissive browsers);
+// fall back to starting on any interaction.
+initAudio(); resumeAudio();
+for (const ev of ["pointerdown", "keydown", "touchstart"])
+  addEventListener(ev, () => { initAudio(); resumeAudio(); });
+addEventListener("keydown", (e) => {
+  if (e.key === "ArrowUp") period = Math.min(4, period + 0.25);
+  else if (e.key === "ArrowDown") period = Math.max(0.5, period - 0.25);
+});
+
+// ---- visuals
+const hist = new Float32Array(1024); // scrolling audio peak strip (ring buffer)
+let histPos = 0;
+let flash = 0, prevPhase = 0;
+
+function draw() {
+  requestAnimationFrame(draw);
+  const t = actx ? actx.currentTime : performance.now() / 1000;
+  const phase = ((t / period) % 1 + 1) % 1;     // 0..1; 0.5 == beep instant
+  const cx = W / 2;
+
+  // detect the centre crossing (phase passes 0.5) for the ring flash
+  if (prevPhase < 0.5 && phase >= 0.5) flash = 1;
+  if (phase < prevPhase) flash = Math.max(flash, 0); // wrap guard
+  prevPhase = phase;
+  flash *= 0.86;
+
+  g.clearRect(0, 0, W, H);
+  g.fillStyle = "#000";
+  g.fillRect(0, 0, W, H);
+
+  // ms ruler around the centre line. bar speed = W/period px/s -> ms/px.
+  const pxPerMs = (W / period) / 1000;
+  g.textAlign = "center";
+  g.font = "14px system-ui, sans-serif";
+  for (let ms = -300; ms <= 300; ms += 50) {
+    const x = cx + ms * pxPerMs;
+    if (x < 0 || x > W) continue;
+    const major = (ms % 100 === 0);
+    g.strokeStyle = ms === 0 ? "#39d353" : (major ? "#444" : "#222");
+    g.lineWidth = ms === 0 ? 3 : 1;
+    g.beginPath(); g.moveTo(x, H * 0.18); g.lineTo(x, H * 0.72); g.stroke();
+    if (major && ms !== 0) {
+      g.fillStyle = "#666";
+      g.fillText((ms > 0 ? "+" : "") + ms + "ms", x, H * 0.16);
+    }
+  }
+  g.fillStyle = "#39d353";
+  g.fillText("0 (beep)", cx, H * 0.16);
+
+  // the sweeping bar
+  const bx = phase * W;
+  g.strokeStyle = "#ff5252";
+  g.lineWidth = 4;
+  g.beginPath(); g.moveTo(bx, H * 0.12); g.lineTo(bx, H * 0.78); g.stroke();
+
+  // flash ring at the centre line (coarse lip-sync cue)
+  if (flash > 0.02) {
+    const r = (1 - flash) * Math.min(W, H) * 0.18 + 8;
+    g.globalAlpha = flash;
+    g.strokeStyle = "#ffffff";
+    g.lineWidth = 8;
+    g.beginPath(); g.arc(cx, H * 0.45, r, 0, Math.PI * 2); g.stroke();
+    g.fillStyle = "#ffffff";
+    g.beginPath(); g.arc(cx, H * 0.45, 10, 0, Math.PI * 2); g.fill();
+    g.globalAlpha = 1;
+  }
+
+  // scrolling audio strip: push current peak, draw the ring buffer
+  let peak = 0;
+  if (analyser) {
+    analyser.getFloatTimeDomainData(td);
+    for (let i = 0; i < td.length; i += 8) {
+      const a = Math.abs(td[i]); if (a > peak) peak = a;
+    }
+  }
+  hist[histPos] = peak;
+  histPos = (histPos + 1) % hist.length;
+  const stripY = H * 0.86, stripH = H * 0.12;
+  g.strokeStyle = "#333";
+  g.lineWidth = 1;
+  g.beginPath(); g.moveTo(0, stripY); g.lineTo(W, stripY); g.stroke();
+  g.strokeStyle = "#4aa3ff";
+  g.lineWidth = 2;
+  g.beginPath();
+  const n = hist.length;
+  for (let i = 0; i < n; i++) {
+    const v = hist[(histPos + i) % n];
+    const x = (i / (n - 1)) * W;
+    const y = stripY - v * stripH;
+    if (i === 0) g.moveTo(x, y); else g.lineTo(x, y);
+  }
+  g.stroke();
+
+  // status
+  g.textAlign = "left";
+  g.fillStyle = "#bbb";
+  g.font = "16px system-ui, sans-serif";
+  const st = actx ? actx.state : "no audio";
+  g.fillText("A/V sync test  |  period " + period.toFixed(2) + "s  |  audio: " + st, 16, 26);
+  if (!actx || actx.state !== "running") {
+    g.fillStyle = "#ffd54a";
+    g.font = "bold 20px system-ui, sans-serif";
+    g.textAlign = "center";
+    g.fillText("click / press a key to enable sound", cx, H * 0.45 - 40);
+  }
+}
+requestAnimationFrame(draw);
+</script>
