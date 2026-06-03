@@ -6,7 +6,6 @@ dist/
 deps/obs-studio/
 deps/obslib/
 deps/onnxruntime/
-deps/opencv/
 models/
 CMakeUserPresets.json
 *.user
