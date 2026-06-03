@@ -61,6 +61,7 @@ float4 PSDeband(VertData v_in) : TARGET
 {
 	float2 uv = v_in.uv;
 	float4 col = image.Sample(linClamp, uv);
+	float src_a = col.a;                    // deband RGB only; preserve source alpha
 
 	float2 pt = 1.0 / image_size;           // one source texel, in uv
 	float2 p  = floor(uv * image_size);     // integer source pixel -> seed
@@ -79,12 +80,14 @@ float4 PSDeband(VertData v_in) : TARGET
 		col = lerp(avg, col, step(thr, diff)); // diff>=thr -> keep col (edge)
 	}
 
-	// A little static grain dithers out any residual step.
+	// A little static grain dithers out any residual step. Scaled by alpha so it
+	// never speckles transparent regions or shows through premultiplied compositing.
 	float3 noise;
 	noise.x = deband_rand(h); h = deband_perm(h);
 	noise.y = deband_rand(h); h = deband_perm(h);
 	noise.z = deband_rand(h); h = deband_perm(h);
-	col.rgb += (deband_grain / 8192.0) * (noise - 0.5);
+	col.rgb += (deband_grain / 8192.0) * (noise - 0.5) * src_a;
+	col.a = src_a; // the loop's float4 lerp also touched alpha; restore the source
 	return col;
 }
 

@@ -1362,7 +1362,12 @@ static void deband_render(void *data, gs_effect_t *)
 		imsz.y = 1.0f;
 	gs_effect_set_vec2(f->p_image_size, &imsz);
 
+	/* Premultiplied-alpha draw, like every obs-filters video filter, so the
+	 * result composites correctly on sources with alpha (no edge darkening). */
+	gs_blend_state_push();
+	gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
 	obs_source_process_filter_end(f->context, f->effect, 0, 0);
+	gs_blend_state_pop();
 }
 
 static enum gs_color_space deband_get_color_space(void *data, size_t,
