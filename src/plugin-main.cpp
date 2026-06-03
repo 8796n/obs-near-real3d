@@ -61,9 +61,6 @@ static const int INFER_H = 252;
  * blend converges to its ghost-free steady state before the static-skip freezes
  * the depth (otherwise a motion trail / post-cut ghost gets frozen in). */
 static const int SETTLE_FRAMES = 8;
-/* Mild Gaussian applied to the INFER_W*INFER_H inference input when "smooth input" is on,
- * to tame compression banding before depth inference (output is unaffected). */
-static const float INPUT_SMOOTH_SIGMA = 0.8f;
 
 /* ---- scene-cut handling (graphics thread) ----
  * The image updates every render frame but the depth lags by the inference
@@ -142,13 +139,12 @@ struct real3d_filter {
 	/* tunables -- written by real3d_update (UI thread), read on the graphics
 	 * thread (render / inference / size queries). Atomic (relaxed) since there
 	 * is no inter-field ordering requirement, just race-free scalar access,
-	 * matching input_smooth/sync_delay/ort.* below. */
+	 * matching sync_delay/ort.* below. */
 	std::atomic<float> frac{0.018f}, convergence{0.5f}, swap_sign{1.0f};
 	std::atomic<bool> full_sbs{true};
 	std::atomic<int> sbs_size{0};   /* 0 = match source, 1 = 1080p (1920x1080/eye) */
 	std::atomic<bool> eye_letterbox{false}; /* aspect-fit source into each eye (vs stretch) */
 	std::atomic<bool> show_depth{false};
-	std::atomic<bool> input_smooth{true}; /* mild blur on inference input */
 	std::atomic<bool> logged_dims{false};
 	std::atomic<uint64_t> infer_interval_ns{66666666ULL}; /* depth cadence; 15 fps default */
 
@@ -292,7 +288,6 @@ static void release_audio_sync(real3d_filter *f)
 static void worker_fn(real3d_filter *f)
 {
 	std::vector<uint8_t> local_in;
-	std::vector<uint8_t> flow_in;
 	std::vector<float> raw, stab;
 	for (;;) {
 		uint32_t gen = 0;
@@ -307,30 +302,14 @@ static void worker_fn(real3d_filter *f)
 			ts = f->in_ts;   /* capture timestamp, for the delay-mode latency measure */
 			f->input_ready = false;
 		}
-		/* Mild blur of the inference input to tame compression banding. Run
-		 * here on the worker (not the graphics thread) so it never stalls
-		 * OBS's video_render; the visible warp uses the full-res frame, so
-		 * output sharpness is unaffected. */
 		const bool temporal = f->ort.temporal.load(std::memory_order_relaxed);
 		const TemporalMode temporal_mode =
 			(TemporalMode)f->ort.temporal_mode.load(std::memory_order_relaxed);
-		const bool input_smooth =
-			f->input_smooth.load(std::memory_order_relaxed);
-		/* Keep sharp luma for the experimental modes' flow / reactive-mask
-		 * decisions. Legacy intentionally retains the release behaviour. The
-		 * model still receives the smoothed copy to suppress compression noise. */
-		if (temporal && temporal_mode != TemporalMode::Legacy && input_smooth)
-			flow_in = local_in;
-		else
-			flow_in.clear();
-		if (input_smooth)
-			nr3d::smoothRGBA(local_in.data(), f->ort.width(),
-					 f->ort.height(), INPUT_SMOOTH_SIGMA);
 
 		/* raw ONNX depth -> normalise + flow-guided temporal stabilise */
 		if (f->ort.Run(local_in.data(), raw)) {
 			f->flow.process(
-				flow_in.empty() ? local_in.data() : flow_in.data(),
+				local_in.data(),
 				f->ort.width(), f->ort.height(), raw, stab,
 				temporal, temporal_mode,
 				f->ort.stab_strength.load(std::memory_order_relaxed),
@@ -397,8 +376,7 @@ static void real3d_update(void *data, obs_data_t *s)
 	f->ort.depth_smooth.store((float)obs_data_get_double(s, "depth_smooth"),
 				  std::memory_order_relaxed);
 	f->show_depth.store(obs_data_get_bool(s, "show_depth"), rel);
-	f->input_smooth.store(obs_data_get_bool(s, "input_smooth"),
-			      std::memory_order_relaxed);
+
 	/* Frame-matched delay: just record intent here; acquiring/releasing the
 	 * parent's audio sync offset and (re)building the frame ring happen on the
 	 * graphics thread in real3d_video_render, where the parent is always valid. */
@@ -495,14 +473,54 @@ static void real3d_destroy(void *data)
 	delete f;
 }
 
-static obs_properties_t *real3d_properties(void *)
+/* get_properties-time check: warn if a 'near Real 3D Deband' filter sits *below*
+ * this one in the parent's filter chain. Filters apply top->bottom, so a deband
+ * below us debands the warped stereo output instead of the source. enum_filters
+ * yields filters in application order (top / source-side first), so a deband seen
+ * *after* we have passed ourselves is mis-ordered. Re-evaluated whenever the
+ * properties panel is (re)opened (there is no live reorder callback). */
+struct deband_order_check {
+	obs_source_t *self;
+	bool seen_self;
+	bool deband_below;
+};
+
+static void real3d_check_deband_order(obs_source_t *, obs_source_t *child, void *param)
 {
+	auto *oc = static_cast<deband_order_check *>(param);
+	if (child == oc->self) {
+		oc->seen_self = true;
+		return;
+	}
+	const char *id = obs_source_get_id(child);
+	if (oc->seen_self && id && strcmp(id, "near_real3d_deband") == 0)
+		oc->deband_below = true;
+}
+
+static obs_properties_t *real3d_properties(void *data)
+{
+	auto *f = static_cast<real3d_filter *>(data);
 	obs_properties_t *p = obs_properties_create();
 	obs_property_t *q;
 
 	/* ---- build identity (top of the panel) ---- */
 	obs_properties_add_text(p, "build_info", REAL3D_BUILD_INFO,
 				OBS_TEXT_INFO);
+
+	/* Mis-ordered Deband warning. Only added when a deband filter is actually
+	 * below us, so it never surfaces for users without the deband filter. */
+	if (f) {
+		deband_order_check oc{f->context, false, false};
+		obs_source_t *parent = obs_filter_get_parent(f->context);
+		if (parent)
+			obs_source_enum_filters(parent, real3d_check_deband_order, &oc);
+		if (oc.deband_below) {
+			obs_property_t *w = obs_properties_add_text(
+				p, "deband_order_warn",
+				obs_module_text("debandorderwarn"), OBS_TEXT_INFO);
+			obs_property_text_set_info_type(w, OBS_TEXT_INFO_WARNING);
+		}
+	}
 
 	/* ---- 3D ---- */
 	obs_properties_t *g3d = obs_properties_create();
@@ -572,9 +590,6 @@ static obs_properties_t *real3d_properties(void *)
 					    obs_module_text("edgesoft"), 0.0, 1.0,
 					    0.05);
 	obs_property_set_long_description(q, obs_module_text("edgesoft.desc"));
-	q = obs_properties_add_bool(gst, "input_smooth",
-				    obs_module_text("inputsmooth"));
-	obs_property_set_long_description(q, obs_module_text("inputsmooth.desc"));
 	q = obs_properties_add_bool(gst, "sync_delay",
 				    obs_module_text("syncdelay"));
 	obs_property_set_long_description(q, obs_module_text("syncdelay.desc"));
@@ -606,7 +621,6 @@ static void real3d_defaults(obs_data_t *s)
 	obs_data_set_default_bool(s, "temporal", true);
 	obs_data_set_default_double(s, "stabilize_strength", 0.4);
 	obs_data_set_default_double(s, "depth_smooth", 0.3);
-	obs_data_set_default_bool(s, "input_smooth", true);
 	obs_data_set_default_bool(s, "sync_delay", false);
 	obs_data_set_default_bool(s, "show_depth", false);
 }
@@ -1200,7 +1214,169 @@ static void real3d_video_tick(void *data, float)
 	}
 }
 
+/* ============================================================================
+ * Standalone debanding filter (near_real3d_deband)
+ *
+ * The same mpv-style deband as the SBS warp's inline path, but as a plain 1:1
+ * image filter so it can sit on any source / anywhere in a filter chain -- not
+ * only on the 3D filter. Runs at the source resolution (taps + grain in true
+ * source pixels; grain added at output resolution = best 8-bit dither). SRGB is
+ * handled by libobs (OBS_SOURCE_SRGB) like obs-filters' sharpness_v2, so it
+ * samples in linear light, matching the inline path. Note: chaining this before
+ * the SBS filter still re-quantises at the SBS 8-bit capture, so for 3D-only use
+ * the SBS filter's built-in Debanding group remains the no-loss path.
+ * ============================================================================ */
+struct deband_filter {
+	obs_source_t *context = nullptr;
+	gs_effect_t *effect = nullptr;
+	gs_eparam_t *p_iters = nullptr, *p_thresh = nullptr, *p_range = nullptr,
+		    *p_grain = nullptr, *p_image_size = nullptr;
+	std::atomic<float> iters{1.0f}, threshold{12.0f}, range{4.0f},
+		grain{9.0f};
+};
+
+static const char *deband_get_name(void *)
+{
+	return "near Real 3D Deband";
+}
+
+static void deband_update(void *data, obs_data_t *s)
+{
+	auto *f = static_cast<deband_filter *>(data);
+	const auto rel = std::memory_order_relaxed;
+	long long it = obs_data_get_int(s, "deband_iterations");
+	if (it < 1 || it > 4)
+		it = 1;
+	f->iters.store((float)it, rel);
+	f->threshold.store((float)obs_data_get_double(s, "deband_threshold"), rel);
+	f->range.store((float)obs_data_get_double(s, "deband_range"), rel);
+	f->grain.store((float)obs_data_get_double(s, "deband_grain"), rel);
+}
+
+static void *deband_create(obs_data_t *settings, obs_source_t *context)
+{
+	auto *f = new deband_filter();
+	f->context = context;
+	char *effect_path = obs_module_file("deband.effect");
+	obs_enter_graphics();
+	f->effect = gs_effect_create_from_file(effect_path, nullptr);
+	if (f->effect) {
+		f->p_iters = gs_effect_get_param_by_name(f->effect, "deband_iters");
+		f->p_thresh = gs_effect_get_param_by_name(f->effect, "deband_threshold");
+		f->p_range = gs_effect_get_param_by_name(f->effect, "deband_range");
+		f->p_grain = gs_effect_get_param_by_name(f->effect, "deband_grain");
+		f->p_image_size = gs_effect_get_param_by_name(f->effect, "image_size");
+	}
+	obs_leave_graphics();
+	bfree(effect_path);
+	if (!f->effect) {
+		blog(LOG_ERROR, "[near-real3d] deband.effect missing -> filter disabled");
+		delete f;
+		return nullptr;
+	}
+	deband_update(f, settings);
+	return f;
+}
+
+static void deband_destroy(void *data)
+{
+	auto *f = static_cast<deband_filter *>(data);
+	obs_enter_graphics();
+	if (f->effect)
+		gs_effect_destroy(f->effect);
+	obs_leave_graphics();
+	delete f;
+}
+
+static obs_properties_t *deband_properties(void *)
+{
+	obs_properties_t *p = obs_properties_create();
+	obs_properties_add_text(p, "build_info", REAL3D_BUILD_INFO, OBS_TEXT_INFO);
+	obs_property_t *it = obs_properties_add_list(
+		p, "deband_iterations", obs_module_text("debanditer"),
+		OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(it, obs_module_text("debanditer.1"), 1);
+	obs_property_list_add_int(it, obs_module_text("debanditer.2"), 2);
+	obs_property_list_add_int(it, obs_module_text("debanditer.3"), 3);
+	obs_property_list_add_int(it, obs_module_text("debanditer.4"), 4);
+	obs_property_set_long_description(it, obs_module_text("debanditer.desc"));
+	obs_property_t *q = obs_properties_add_float_slider(
+		p, "deband_threshold", obs_module_text("debandthresh"), 0.0,
+		200.0, 1.0);
+	obs_property_set_long_description(q, obs_module_text("debandthresh.desc"));
+	q = obs_properties_add_float_slider(p, "deband_range",
+					    obs_module_text("debandrange"), 1.0,
+					    64.0, 1.0);
+	obs_property_set_long_description(q, obs_module_text("debandrange.desc"));
+	q = obs_properties_add_float_slider(p, "deband_grain",
+					    obs_module_text("debandgrain"), 0.0,
+					    100.0, 1.0);
+	obs_property_set_long_description(q, obs_module_text("debandgrain.desc"));
+	return p;
+}
+
+static void deband_defaults(obs_data_t *s)
+{
+	obs_data_set_default_int(s, "deband_iterations", 1);
+	obs_data_set_default_double(s, "deband_threshold", 12.0);
+	obs_data_set_default_double(s, "deband_range", 4.0);
+	obs_data_set_default_double(s, "deband_grain", 9.0);
+}
+
+static void deband_render(void *data, gs_effect_t *)
+{
+	auto *f = static_cast<deband_filter *>(data);
+	obs_source_t *target = obs_filter_get_target(f->context);
+	if (!f->effect || !target) {
+		obs_source_skip_video_filter(f->context);
+		return;
+	}
+
+	/* SRGB-aware like obs-filters' sharpness_v2: SDR passes through as
+	 * GS_RGBA / GS_CS_SRGB (sampled in linear light); HDR (extended) sources
+	 * are passed through untouched. */
+	const enum gs_color_space pref[] = {GS_CS_SRGB, GS_CS_SRGB_16F,
+					    GS_CS_709_EXTENDED};
+	const enum gs_color_space space =
+		obs_source_get_color_space(target, 3, pref);
+	if (space == GS_CS_709_EXTENDED) {
+		obs_source_skip_video_filter(f->context);
+		return;
+	}
+	const enum gs_color_format fmt = gs_get_format_from_space(space);
+	if (!obs_source_process_filter_begin_with_color_space(
+		    f->context, fmt, space, OBS_ALLOW_DIRECT_RENDERING))
+		return;
+
+	const auto rel = std::memory_order_relaxed;
+	gs_effect_set_float(f->p_iters, f->iters.load(rel));
+	gs_effect_set_float(f->p_thresh, f->threshold.load(rel));
+	gs_effect_set_float(f->p_range, f->range.load(rel));
+	gs_effect_set_float(f->p_grain, f->grain.load(rel));
+	struct vec2 imsz;
+	imsz.x = (float)obs_source_get_width(target);
+	imsz.y = (float)obs_source_get_height(target);
+	if (imsz.x < 1.0f)
+		imsz.x = 1.0f;
+	if (imsz.y < 1.0f)
+		imsz.y = 1.0f;
+	gs_effect_set_vec2(f->p_image_size, &imsz);
+
+	obs_source_process_filter_end(f->context, f->effect, 0, 0);
+}
+
+static enum gs_color_space deband_get_color_space(void *data, size_t,
+						  const enum gs_color_space *)
+{
+	auto *f = static_cast<deband_filter *>(data);
+	const enum gs_color_space pref[] = {GS_CS_SRGB, GS_CS_SRGB_16F,
+					    GS_CS_709_EXTENDED};
+	return obs_source_get_color_space(obs_filter_get_target(f->context), 3,
+					  pref);
+}
+
 static struct obs_source_info real3d_filter_info = {};
+static struct obs_source_info real3d_deband_info = {};
 
 bool obs_module_load(void)
 {
@@ -1221,6 +1397,21 @@ bool obs_module_load(void)
 	real3d_filter_info.video_render = real3d_video_render;
 	real3d_filter_info.video_tick = real3d_video_tick;
 	obs_register_source(&real3d_filter_info);
+
+	/* Standalone deband filter (shares this module). SRGB-aware; no async/tick. */
+	real3d_deband_info.id = "near_real3d_deband";
+	real3d_deband_info.type = OBS_SOURCE_TYPE_FILTER;
+	real3d_deband_info.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_SRGB;
+	real3d_deband_info.get_name = deband_get_name;
+	real3d_deband_info.create = deband_create;
+	real3d_deband_info.destroy = deband_destroy;
+	real3d_deband_info.update = deband_update;
+	real3d_deband_info.get_properties = deband_properties;
+	real3d_deband_info.get_defaults = deband_defaults;
+	real3d_deband_info.video_render = deband_render;
+	real3d_deband_info.video_get_color_space = deband_get_color_space;
+	obs_register_source(&real3d_deband_info);
+
 	blog(LOG_INFO, "[near-real3d] loaded: %s (libobs %d.%d.%d)",
 	     REAL3D_BUILD_INFO, LIBOBS_API_MAJOR_VER, LIBOBS_API_MINOR_VER,
 	     LIBOBS_API_PATCH_VER);

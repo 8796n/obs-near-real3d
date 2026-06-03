@@ -1,0 +1,98 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 8796n <info@8796.jp>
+/*
+ * Standalone debanding filter (mpv/libplacebo pass_sample_deband).
+ *
+ * The same deband used inside near-real3d.effect's warp, but as a plain 1:1
+ * image filter so it can sit anywhere in an OBS filter chain (not only on the
+ * 3D filter). Runs at the source resolution, so the tap radius and grain are in
+ * true source pixels and the grain lands at output resolution -- the best place
+ * to dither the final 8-bit output. SRGB is handled by libobs (OBS_SOURCE_SRGB),
+ * so this samples in linear light, matching the inline path.
+ */
+uniform float4x4 ViewProj;
+uniform texture2d image;
+
+uniform float deband_iters;     // passes per pixel (1..4)
+uniform float deband_threshold; // accept threshold, mpv scale (48 = mpv default)
+uniform float deband_range;     // initial tap radius in pixels (mpv default 16)
+uniform float deband_grain;     // static dither amount, mpv scale (mpv default 48)
+uniform float2 image_size;      // source resolution in px, for pixel-space taps
+
+sampler_state linClamp {
+	Filter   = Linear;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData o;
+	o.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	o.uv = v_in.uv;
+	return o;
+}
+
+// PRNG: webgl-noise float "permute" hash (no uint/bitops). Seeded from the pixel
+// so the grain is temporally static (no shimmer).
+float deband_mod289(float x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+float deband_perm(float x)   { return deband_mod289((34.0 * x + 1.0) * x); }
+float deband_rand(float x)   { return frac(x * (1.0 / 41.0)); }
+
+// Stochastic 4-tap average on a ring `radius` pixels around uv.
+float4 deband_average(float2 uv, float radius, float2 pt, inout float h)
+{
+	float dist = deband_rand(h) * radius;    h = deband_perm(h);
+	float dir  = deband_rand(h) * 6.2831853; h = deband_perm(h);
+	float2 o = dist * float2(cos(dir), sin(dir)) * pt; // pixels -> uv
+	float4 r0 = image.Sample(linClamp, uv + o);
+	float4 r1 = image.Sample(linClamp, uv - o);
+	float4 r2 = image.Sample(linClamp, uv + float2(-o.y, o.x));
+	float4 r3 = image.Sample(linClamp, uv + float2(o.y, -o.x));
+	return (r0 + r1 + r2 + r3) * 0.25;
+}
+
+float4 PSDeband(VertData v_in) : TARGET
+{
+	float2 uv = v_in.uv;
+	float4 col = image.Sample(linClamp, uv);
+
+	float2 pt = 1.0 / image_size;           // one source texel, in uv
+	float2 p  = floor(uv * image_size);     // integer source pixel -> seed
+	float h = deband_perm(deband_perm(deband_perm(p.x) + p.y) + 11.0);
+
+	// Each pass averages over a larger radius but accepts a smaller step; the
+	// average replaces the pixel only where the local difference is below the
+	// threshold (real edges are kept). Scales match mpv: threshold / (i*16384)
+	// and grain / 8192 on [0,1] color.
+	for (int i = 1; i <= 4; i++) {
+		if (i > deband_iters)
+			break;
+		float4 avg  = deband_average(uv, deband_range * (float)i, pt, h);
+		float4 diff = abs(col - avg);
+		float  thr  = deband_threshold / ((float)i * 16384.0);
+		col = lerp(avg, col, step(thr, diff)); // diff>=thr -> keep col (edge)
+	}
+
+	// A little static grain dithers out any residual step.
+	float3 noise;
+	noise.x = deband_rand(h); h = deband_perm(h);
+	noise.y = deband_rand(h); h = deband_perm(h);
+	noise.z = deband_rand(h); h = deband_perm(h);
+	col.rgb += (deband_grain / 8192.0) * (noise - 0.5);
+	return col;
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSDeband(v_in);
+	}
+}
