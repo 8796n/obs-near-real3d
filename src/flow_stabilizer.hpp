@@ -261,28 +261,6 @@ inline void dilateMask(std::vector<uint8_t> &mask, int w, int h, int radius)
 		}
 }
 
-/* Mild per-channel blur of an RGBA8 buffer in place (inference-input only):
- * smooths compression banding / block noise so the depth model doesn't read
- * tone jumps as depth steps. Reuses the separable Gaussian above. The visible
- * warp samples the full-res frame, so this never softens the output image. */
-inline void smoothRGBA(uint8_t *rgba, int w, int h, float sigma)
-{
-	if (sigma <= 0.f)
-		return;
-	const int n = w * h;
-	std::vector<float> ch((size_t)n);
-	for (int c = 0; c < 3; ++c) { /* R,G,B; leave alpha */
-		for (int i = 0; i < n; ++i)
-			ch[i] = (float)rgba[(size_t)i * 4 + c];
-		gaussianBlur(ch, w, h, sigma);
-		for (int i = 0; i < n; ++i) {
-			float v = ch[i] + 0.5f;
-			rgba[(size_t)i * 4 + c] =
-				(uint8_t)(v < 0.f ? 0.f : (v > 255.f ? 255.f : v));
-		}
-	}
-}
-
 /* Dense pyramidal Lucas-Kanade. Returns flow (u,v) such that
  * prev(x) ~= cur(x + (u,v)); i.e. cur(X) ~= prev(X - (u,v)). Frame is width x
  * height (each pyramid axis is halved independently). */
