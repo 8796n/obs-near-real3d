@@ -126,7 +126,8 @@ struct real3d_filter {
 	gs_eparam_t *p_image = nullptr, *p_strength = nullptr,
 		    *p_conv = nullptr, *p_swap = nullptr,
 		    *p_usedepth = nullptr, *p_depthtex = nullptr,
-		    *p_showdepth = nullptr, *p_eyefit = nullptr;
+		    *p_showdepth = nullptr, *p_eyefit = nullptr,
+		    *p_dither = nullptr, *p_outsize = nullptr;
 
 	gs_texrender_t *rt_full = nullptr;  /* captured input at WxH */
 	gs_texrender_t *rt_pre[2] = {nullptr, nullptr}; /* ping-pong halving pyramid */
@@ -144,6 +145,7 @@ struct real3d_filter {
 	std::atomic<bool> full_sbs{true};
 	std::atomic<int> sbs_size{0};   /* 0 = match source, 1 = 1080p (1920x1080/eye) */
 	std::atomic<bool> eye_letterbox{false}; /* aspect-fit source into each eye (vs stretch) */
+	std::atomic<float> dither{12.0f}; /* output dither amount (mpv-grain scale); 0 = off */
 	std::atomic<bool> show_depth{false};
 	std::atomic<bool> logged_dims{false};
 	std::atomic<uint64_t> infer_interval_ns{66666666ULL}; /* depth cadence; 15 fps default */
@@ -352,6 +354,7 @@ static void real3d_update(void *data, obs_data_t *s)
 	f->full_sbs.store(full_sbs, rel);
 	f->sbs_size.store((int)obs_data_get_int(s, "sbs_size"), rel);
 	f->eye_letterbox.store(obs_data_get_bool(s, "eye_letterbox"), rel);
+	f->dither.store((float)obs_data_get_double(s, "dither"), rel);
 	if (prev != full_sbs)
 		f->logged_dims.store(false, rel); /* re-log new output size once */
 
@@ -403,6 +406,8 @@ static void *real3d_create(obs_data_t *settings, obs_source_t *context)
 		f->p_depthtex = gs_effect_get_param_by_name(f->effect, "depth_tex");
 		f->p_showdepth = gs_effect_get_param_by_name(f->effect, "show_depth");
 		f->p_eyefit = gs_effect_get_param_by_name(f->effect, "eye_fit");
+		f->p_dither = gs_effect_get_param_by_name(f->effect, "dither");
+		f->p_outsize = gs_effect_get_param_by_name(f->effect, "out_size");
 	}
 	f->rt_full = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
 	f->rt_pre[0] = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
@@ -548,6 +553,10 @@ static obs_properties_t *real3d_properties(void *data)
 	q = obs_properties_add_bool(g3d, "eye_letterbox",
 				    obs_module_text("letterbox"));
 	obs_property_set_long_description(q, obs_module_text("letterbox.desc"));
+	q = obs_properties_add_float_slider(g3d, "dither",
+					    obs_module_text("dither"), 0.0, 100.0,
+					    1.0);
+	obs_property_set_long_description(q, obs_module_text("dither.desc"));
 	obs_properties_add_group(p, "grp_3d", obs_module_text("group.3d"),
 				 OBS_GROUP_NORMAL, g3d);
 
@@ -615,6 +624,7 @@ static void real3d_defaults(obs_data_t *s)
 	obs_data_set_default_bool(s, "full_sbs", true);
 	obs_data_set_default_int(s, "sbs_size", 0);
 	obs_data_set_default_bool(s, "eye_letterbox", false);
+	obs_data_set_default_double(s, "dither", 12.0);
 	obs_data_set_default_int(s, "infer_fps", 15);
 	obs_data_set_default_bool(s, "skip_static", true);
 	obs_data_set_default_double(s, "static_thresh", 1.0);
@@ -1155,6 +1165,14 @@ static void real3d_video_render(void *data, gs_effect_t *)
 
 	const uint32_t out_w = full_sbs ? eyeW * 2 : eyeW;
 	const uint32_t out_h = eyeH;
+	/* Output dither: seeded from the output pixel, so the shader needs the SBS
+	 * output dims. Applied at the warp's final 8-bit write to mask the banding
+	 * its own re-quantization would re-create (see near-real3d.effect). */
+	gs_effect_set_float(f->p_dither, f->dither.load(rel));
+	struct vec2 osz;
+	osz.x = (float)out_w;
+	osz.y = (float)out_h;
+	gs_effect_set_vec2(f->p_outsize, &osz);
 	if (!f->logged_dims.load(rel)) {
 		f->logged_dims.store(true, rel);
 		blog(LOG_INFO, "[near-real3d] output %ux%u (%s, source %ux%u) linear_srgb=%d",

@@ -22,6 +22,8 @@ uniform float swap_sign;        // +1 or -1 to flip left/right
 uniform float use_depth_tex;    // 0 = procedural luminance depth, 1 = depth_tex
 uniform float show_depth;       // debug: 1 = output the depth map as grayscale
 uniform float2 eye_fit;         // source sub-rect in each eye; (1,1) = stretch-fill
+uniform float dither;           // output dither amount (mpv-grain scale); 0 = off
+uniform float2 out_size;        // SBS output resolution in px, for the dither seed
 
 sampler_state linClamp {
 	Filter   = Linear;
@@ -41,6 +43,13 @@ VertData VSDefault(VertData v_in)
 	o.uv = v_in.uv;
 	return o;
 }
+
+// PRNG for the output dither: webgl-noise float "permute" hash (no uint/bitops),
+// matching deband.effect. Seeded from the output pixel so the dither is
+// temporally static (no shimmer).
+float dith_mod289(float x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+float dith_perm(float x)   { return dith_mod289((34.0 * x + 1.0) * x); }
+float dith_rand(float x)   { return frac(x * (1.0 / 41.0)); }
 
 float depth_at(float2 uv)
 {
@@ -79,6 +88,31 @@ float4 PSStereoSBS(VertData v_in) : TARGET
 	float sgn = lerp(-swap_sign, swap_sign, eyeRight);
 	float2 suv = float2(euv.x + sgn * disp * 0.5, euv.y);
 	float4 col = image.Sample(linClamp, suv);
+
+	// Output dither: the warp resamples in linear light and re-encodes to 8-bit
+	// sRGB on store; that final re-quantization is otherwise undithered, so it
+	// re-creates banding (worst in dark gradients, which the warp's magnification
+	// also stretches) that a source-side deband can't prevent. Add a tiny
+	// triangular-PDF (TPDF) noise -- the correct dither for uniform quantization --
+	// seeded from the integer output pixel so it stays put (no shimmer). The
+	// amplitude is in linear light like deband.effect's grain, so it covers
+	// several code steps exactly where it matters: the darks. (dither/16384 per
+	// TPDF tap matches deband's peak-to-peak at the same slider value.)
+	if (dither > 0.0) {
+		float2 p = floor(v_in.uv * out_size);
+		float h = dith_perm(dith_perm(dith_perm(p.x) + p.y) + 23.0);
+		float amp = dither / 16384.0;
+		float3 n;
+		float a, b;
+		a = dith_rand(h); h = dith_perm(h);
+		b = dith_rand(h); h = dith_perm(h); n.x = a + b - 1.0; // TPDF in [-1,1]
+		a = dith_rand(h); h = dith_perm(h);
+		b = dith_rand(h); h = dith_perm(h); n.y = a + b - 1.0;
+		a = dith_rand(h); h = dith_perm(h);
+		b = dith_rand(h); h = dith_perm(h); n.z = a + b - 1.0;
+		col.rgb += amp * n;
+	}
+
 	col.rgb *= inside;
 	return col;
 }
