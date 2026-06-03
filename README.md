@@ -173,6 +173,13 @@ SBS 対応のグラス/ディスプレイへ送るなら、SBS 出力したシ�
 - sRGB 厳密化は対応済。DA V2↔DPT 切替 / 共有セッション化 / 非同期 readback は今後の候補。
 - 現状 Depth Anything V2 Small 固定(別サイズ/別モデルへ差し替え可能)。
 
+## 変更履歴 / 廃止された機能
+
+- **v0.3.0**
+  - **追加**: 独立デバンドフィルタ **near Real 3D Deband**（mpv 方式のバンディング低減。「使い方 → デバンドフィルタ」参照）。当初は SBS 内蔵案もあったが、コード重複・Full-SBS で per-eye 2倍・深度入力を綺麗にできない等の理由で独立フィルタへ一本化（内蔵版は未リリース）。
+  - **廃止**: **Smooth inference input（推論入力を平滑）** — 推論サイズ(448×252)への面積平均縮小が既にバンディングを十分均し、追加の Gaussian がほぼ冗長だったため。バンディング低減が必要なら **near Real 3D Deband** をソースの上流（near Real 3D の〈上〉）に置く。
+  - 既存シーンに残る `input_smooth` 等の設定キーは無害（無視されるだけ・クラッシュなし）。
+
 ## ファイル構成
 
 - `src/plugin-main.cpp` — フィルター本体(フレーム取得・推論オーケストレーション・warp 描画・SBS 出力)
@@ -195,8 +202,8 @@ SBS 対応のグラス/ディスプレイへ送るなら、SBS 出力したシ�
    - `MODEL_SHA256` … モデルの SHA-256（**タグリリースでは必須**。未設定だと CI が失敗）。現行モデル（**448×252 / 16:9 / FP16**）の値:
      `3C8DE7CCC0FAA9E266B6389628B9823412F25D995202AB58D9306A50A185CC5C`
      （`Get-FileHash depth_anything_v2_small.onnx -Algorithm SHA256` で確認可。再生成は `tools/export_onnx.py --width 448 --height 252`）
-2. **リリース**: `v0.2.3` のような **タグを push** すると、CI が 依存取得 → `-DPLUGIN_VERSION=<タグ>` でビルド → `package.ps1` で ZIP＋インストーラ生成 → その Release に添付（バージョンはタグ由来。手動実行時は `0.2.<run_number>`）。
-3. **ローカルでも生成可**: `setup.ps1` → `build.ps1` → `package.ps1 -Version 0.2.3` で `dist/` に ZIP（＋Inno Setup があればインストーラ）。初回や CI 整備前の手動アップロードに。
+2. **リリース**: `v0.3.0` のような **タグを push** すると、CI が 依存取得 → `-DPLUGIN_VERSION=<タグ>` でビルド → `package.ps1` で ZIP＋インストーラ生成 → その Release に添付（バージョンはタグ由来。手動実行時は `0.3.<run_number>`）。
+3. **ローカルでも生成可**: `setup.ps1` → `build.ps1` → `package.ps1 -Version 0.3.0` で `dist/` に ZIP（＋Inno Setup があればインストーラ）。初回や CI 整備前の手動アップロードに。
 
 ## ライセンス
 
