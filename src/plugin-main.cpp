@@ -1217,14 +1217,14 @@ static void real3d_video_tick(void *data, float)
 /* ============================================================================
  * Standalone debanding filter (near_real3d_deband)
  *
- * The same mpv-style deband as the SBS warp's inline path, but as a plain 1:1
- * image filter so it can sit on any source / anywhere in a filter chain -- not
- * only on the 3D filter. Runs at the source resolution (taps + grain in true
- * source pixels; grain added at output resolution = best 8-bit dither). SRGB is
- * handled by libobs (OBS_SOURCE_SRGB) like obs-filters' sharpness_v2, so it
- * samples in linear light, matching the inline path. Note: chaining this before
- * the SBS filter still re-quantises at the SBS 8-bit capture, so for 3D-only use
- * the SBS filter's built-in Debanding group remains the no-loss path.
+ * An mpv-style deband as a plain 1:1 image filter, so it can sit on any source /
+ * anywhere in a filter chain -- not only on the 3D filter. Runs at the source
+ * resolution (taps + grain in true source pixels; grain added at output
+ * resolution = best 8-bit dither). SRGB is handled by libobs (OBS_SOURCE_SRGB)
+ * like obs-filters' sharpness_v2, so it samples in linear light. For 3D use,
+ * place this above the SBS filter: it debands/dithers the source the warp then
+ * samples (the warp's 8-bit re-sampling can still leave faint residual banding,
+ * which the grain masks). The 3D filter warns if a deband sits below it.
  * ============================================================================ */
 struct deband_filter {
 	obs_source_t *context = nullptr;
