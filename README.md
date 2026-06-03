@@ -178,6 +178,8 @@ SBS 対応のグラス/ディスプレイへ送るなら、SBS 出力したシ�
 
 ## 変更履歴 / 廃止された機能
 
+- **v0.3.1**
+  - **追加**: **Output dither**（near Real 3D / 3D グループ）— warp 自身の 8bit 再量子化が再生成するバンディング（暗部グラデで顕著／warp が引き伸ばす領域も）を、出力解像度で三角分布(TPDF)ディザによりマスク。0–100 スライダ（既定 12、0=オフ）。`near Real 3D Deband` が**ソースの既存バンド**を消すのに対し、こちらは**warp が新たに作る段差**を抑える別役割。
 - **v0.3.0**
   - **追加**: 独立デバンドフィルタ **near Real 3D Deband**（mpv 方式のバンディング低減。「使い方 → デバンドフィルタ」参照）。当初は SBS 内蔵案もあったが、コード重複・Full-SBS で per-eye 2倍・深度入力を綺麗にできない等の理由で独立フィルタへ一本化（内蔵版は未リリース）。
   - **廃止**: **Smooth inference input（推論入力を平滑）** — 推論サイズ(448×252)への面積平均縮小が既にバンディングを十分均し、追加の Gaussian がほぼ冗長だったため。バンディング低減が必要なら **near Real 3D Deband** をソースの上流（near Real 3D の〈上〉）に置く。
@@ -207,8 +209,8 @@ SBS 対応のグラス/ディスプレイへ送るなら、SBS 出力したシ�
    - `MODEL_SHA256` … モデルの SHA-256（**タグリリースでは必須**。未設定だと CI が失敗）。現行モデル（**448×252 / 16:9 / FP16**）の値:
      `3C8DE7CCC0FAA9E266B6389628B9823412F25D995202AB58D9306A50A185CC5C`
      （`Get-FileHash depth_anything_v2_small.onnx -Algorithm SHA256` で確認可。再生成は `tools/export_onnx.py --width 448 --height 252`）
-2. **リリース**: `v0.3.0` のような **タグを push** すると、CI が 依存取得 → `-DPLUGIN_VERSION=<タグ>` でビルド → `package.ps1` で ZIP＋インストーラ生成 → その Release に添付（バージョンはタグ由来。手動実行時は `0.3.<run_number>`）。
-3. **ローカルでも生成可**: `setup.ps1` → `build.ps1` → `package.ps1 -Version 0.3.0` で `dist/` に ZIP（＋Inno Setup があればインストーラ）。初回や CI 整備前の手動アップロードに。
+2. **リリース**: `v0.3.1` のような **タグを push** すると、CI が 依存取得 → `-DPLUGIN_VERSION=<タグ>` でビルド → `package.ps1` で ZIP＋インストーラ生成 → その Release に添付（バージョンはタグ由来。手動実行時は `0.3.<run_number>`）。
+3. **ローカルでも生成可**: `setup.ps1` → `build.ps1` → `package.ps1 -Version 0.3.1` で `dist/` に ZIP（＋Inno Setup があればインストーラ）。初回や CI 整備前の手動アップロードに。
 
 ## ライセンス
 
