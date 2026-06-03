@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(obs-near-real3d VERSION 0.3.0 LANGUAGES C CXX)
+project(obs-near-real3d VERSION 0.3.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -29,7 +29,7 @@ target_link_libraries(obs-near-real3d PRIVATE
 set_target_properties(obs-near-real3d PROPERTIES PREFIX "" OUTPUT_NAME "obs-near-real3d")
 
 # Version string baked into the binary (shown in the filter UI + logs). CI
-# overrides it for releases, e.g. -DPLUGIN_VERSION=v0.3.0 for a tag build;
+# overrides it for releases, e.g. -DPLUGIN_VERSION=v0.3.1 for a tag build;
 # local/IDE builds fall back to the project version with a -dev suffix.
 if(NOT DEFINED PLUGIN_VERSION OR PLUGIN_VERSION STREQUAL "")
   set(PLUGIN_VERSION "${PROJECT_VERSION}-dev")
