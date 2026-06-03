@@ -3,12 +3,11 @@
 /*
  * Standalone debanding filter (mpv/libplacebo pass_sample_deband).
  *
- * The same deband used inside near-real3d.effect's warp, but as a plain 1:1
- * image filter so it can sit anywhere in an OBS filter chain (not only on the
- * 3D filter). Runs at the source resolution, so the tap radius and grain are in
- * true source pixels and the grain lands at output resolution -- the best place
- * to dither the final 8-bit output. SRGB is handled by libobs (OBS_SOURCE_SRGB),
- * so this samples in linear light, matching the inline path.
+ * A plain 1:1 image filter so it can sit anywhere in an OBS filter chain (not
+ * only on the 3D filter). Runs at the source resolution, so the tap radius and
+ * grain are in true source pixels and the grain lands at output resolution --
+ * the best place to dither the final 8-bit output. SRGB is handled by libobs
+ * (OBS_SOURCE_SRGB), so this samples in linear light.
  */
 uniform float4x4 ViewProj;
 uniform texture2d image;
