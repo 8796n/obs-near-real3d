@@ -87,13 +87,23 @@ static const uint64_t RESUME_GAP_NS = 500000000ULL;
 
 /* ---- frame-matched delay mode (optional) ----
  * The depth lags the image by the inference pipeline latency, so by default the
- * warp applies slightly-stale depth to the current frame. In this mode we hold a
- * ring of recent full-res frames and warp the one that *matches* the depth we
- * currently have (latency measured via a capture-timestamp round-trip through
- * the worker), removing the constant-latency part of the misalignment. Cost:
- * the displayed video is delayed by that latency (~0.1 s) and the frame ring
- * uses extra VRAM. Audio is delayed to match via the source's sync offset. */
+ * warp applies slightly-stale depth to the current frame. In this mode we delay
+ * the displayed image by that latency (a ring of recent full-res frames) and,
+ * instead of always warping with the *latest* depth, we keep a small cache of
+ * recent depths and pick the one that corresponds to the frame actually being
+ * shown -- matched by scene generation (hard boundary, never mix scenes) then by
+ * capture timestamp (which frame within the scene). This keeps the 3D alive
+ * across a hard cut even when the off-cadence post-cut inference returns early,
+ * because the prior scene's depth is still cached for the prior-scene frames the
+ * ring is still showing. Cost: the displayed video is delayed by the latency
+ * (~0.1 s) plus a little extra VRAM. Audio is delayed to match via the source's
+ * sync offset. */
 static const int DELAY_RING_MAX = 16;            /* cap on buffered frames (VRAM bound) */
+/* Depth cache: enough recent depths to cover the delay window (sized per frame
+ * from the committed delay and the inference cadence). R32F INFER_WxINFER_H is
+ * ~0.43 MB/slot, so even the cap is a few MB. */
+static const int DEPTH_CACHE_MAX = 20;           /* hard cap on cached depths (VRAM bound) */
+static const int DEPTH_CACHE_MARGIN = 2;         /* spare slots beyond the delay window */
 static const float DELAY_EMA = 0.85f;            /* latency low-pass (per inference) */
 /* The committed delay (frames) drives BOTH the video ring and the audio sync
  * offset. Video can change cheaply every frame, but changing the audio offset
@@ -120,6 +130,18 @@ static std::wstring utf8_to_wide(const char *s)
 	return w;
 }
 
+/* One cached depth result. The cache (graphics thread only) holds a few recent
+ * depths so frame-matched delay mode can warp the frame being *shown* with the
+ * depth that corresponds to it, not just the latest one. `gen` is the scene-cut
+ * generation it was computed for (hard match), `ts` the capture timestamp of its
+ * source frame (fine match within a scene). `valid` is false until first written. */
+struct depth_slot {
+	gs_texture_t *tex = nullptr;  /* INFER_W*INFER_H R32F */
+	uint32_t gen = 0;
+	uint64_t ts = 0;
+	bool valid = false;
+};
+
 struct real3d_filter {
 	obs_source_t *context = nullptr;
 	gs_effect_t *effect = nullptr;
@@ -127,7 +149,8 @@ struct real3d_filter {
 		    *p_conv = nullptr, *p_swap = nullptr,
 		    *p_usedepth = nullptr, *p_depthtex = nullptr,
 		    *p_showdepth = nullptr, *p_eyefit = nullptr,
-		    *p_dither = nullptr, *p_outsize = nullptr;
+		    *p_dither = nullptr, *p_outsize = nullptr,
+		    *p_debug = nullptr;
 
 	gs_texrender_t *rt_full = nullptr;  /* captured input at WxH */
 	gs_texrender_t *rt_pre[2] = {nullptr, nullptr}; /* ping-pong halving pyramid */
@@ -135,7 +158,15 @@ struct real3d_filter {
 	gs_stagesurf_t *stage[2] = {nullptr, nullptr}; /* GPU->CPU readback, ping-pong */
 	int stage_cur = 0;             /* surface staged this tick; map the other */
 	bool stage_primed = false;     /* false until both surfaces hold a frame */
-	gs_texture_t *depth_tex = nullptr;  /* INFER_W*INFER_H R32F */
+	/* Depth cache: recent depths keyed by (gen, ts) so the warp can pick the one
+	 * matching the frame being shown (see frame-matched delay mode). depth_flat is
+	 * a constant flat-0.5 fallback bound when no cached depth matches (warm-up /
+	 * unmatched), where the disparity is held at 0 anyway so its content is moot.
+	 * Graphics thread only. */
+	std::vector<depth_slot> depth_cache;
+	int depth_widx = 0;            /* next cache slot to overwrite (round-robin) */
+	int depth_used = 0;            /* effective live slots (<= allocated); 1 in debug A/B */
+	gs_texture_t *depth_flat = nullptr; /* INFER_W*INFER_H R32F, flat 0.5 fallback */
 
 	/* tunables -- written by real3d_update (UI thread), read on the graphics
 	 * thread (render / inference / size queries). Atomic (relaxed) since there
@@ -147,6 +178,12 @@ struct real3d_filter {
 	std::atomic<bool> eye_letterbox{false}; /* aspect-fit source into each eye (vs stretch) */
 	std::atomic<float> dither{12.0f}; /* output dither amount (mpv-grain scale); 0 = off */
 	std::atomic<bool> show_depth{false};
+	/* debug: tint the warp by per-frame depth-match state (red = 2D fallback,
+	 * yellow = ramping) so the otherwise-invisible cut behaviour is visible; and
+	 * force the depth cache to a single live slot, reproducing the pre-cache
+	 * "latest depth only" behaviour for an instant A/B of the matching fix. */
+	std::atomic<bool> debug_overlay{false};
+	std::atomic<bool> debug_cache1{false};
 	std::atomic<bool> logged_dims{false};
 	std::atomic<uint64_t> infer_interval_ns{66666666ULL}; /* depth cadence; 15 fps default */
 
@@ -165,11 +202,19 @@ struct real3d_filter {
 	uint32_t out_gen = 0;          /* (m) generation depth_buf was computed for */
 	uint64_t in_ts = 0;            /* (m) capture timestamp of in_buf's frame (ns) */
 	uint64_t out_ts = 0;           /* (m) capture timestamp depth_buf was computed for */
+	/* debug latency decomposition: submit time of in_buf, and the worker's
+	 * submit->pickup wait + compute time for the produced depth. Lets the log
+	 * split the capture->depth latency so we can see where the cut-path excess
+	 * over `commit` actually goes (worker busy-wait vs inference compute). */
+	uint64_t in_submit_ns = 0;     /* (m) os_gettime_ns when in_buf was queued */
+	uint64_t out_wait_ns = 0;      /* (m) submit -> worker started Run */
+	uint64_t out_compute_ns = 0;   /* (m) Run + temporal stabilise */
 	bool logged_first_depth = false;
+	uint32_t last_logged_depth_gen = 0xFFFFFFFFu; /* debug: log first depth per gen once */
 	uint64_t last_submit_ns = 0;
 
 	/* static-frame skip: when the downscaled input barely changes we reuse
-	 * the depth already in depth_tex instead of re-running ONNX */
+	 * the depth already cached instead of re-running ONNX */
 	std::vector<uint8_t> readback; /* reused INFER_W*INFER_H*4 readback scratch (graphics thread) */
 	std::vector<uint8_t> prev_in; /* last *inferred* INFER_W*INFER_H*4 frame */
 	std::atomic<bool> skip_static{true};       /* UI thread writes, graphics reads */
@@ -177,32 +222,41 @@ struct real3d_filter {
 	int settle_left = 0;          /* remaining settle inferences after motion */
 
 	/* scene-cut handling (graphics thread only, except in_gen/out_gen under m).
-	 * The disparity is flattened (2D) whenever the frame we are about to warp
-	 * and the depth we currently hold are from different scenes -- i.e.
-	 * shown_gen != depth_gen. Comparing the *displayed* frame's generation makes
-	 * this correct in frame-matched delay mode too: there the shown frame is
-	 * delayed by the ring, so the flat hold starts when the post-cut frame is
-	 * actually displayed (not when the cut is detected) and lifts when the
-	 * matching depth lands -- no needless flattening of the old scene's tail. */
+	 * The disparity is flattened (2D) whenever the frame we are about to warp has
+	 * no matching cached depth (same scene generation, near capture timestamp).
+	 * Matching against the *displayed* frame makes this correct in frame-matched
+	 * delay mode too: there the shown frame is delayed by the ring, so the flat
+	 * hold engages only when an unmatched post-cut frame actually reaches the
+	 * screen and lifts the moment its matching depth lands -- the old scene's tail
+	 * keeps its 3D from the cached prior-scene depth. */
 	uint64_t last_detect_ns = 0;  /* cut-detection cadence (canvas fps, capped) */
 	std::vector<uint8_t> prev_detect; /* previous frame sampled for cut detection */
 	uint32_t scene_gen = 0;       /* ++ on each detected cut; tags freshly captured frames */
-	uint32_t depth_gen = 0;       /* scene generation of the depth now in depth_tex */
 	float disp_scale = 1.0f;      /* 0..1 multiplier on frac; ramps back after a cut */
 	uint64_t stale_since_ns = 0;  /* when the current flat hold started (0 = not flat); failsafe */
+	bool stale_logged = false;    /* debug: failsafe-lift warning logged once per hold */
+	uint64_t depth_match_dt = 0;  /* debug: |shown_ts - matched depth ts| from the last pick */
 	uint64_t last_render_ns = 0;  /* previous render timestamp, for fps-independent ramp */
 
 	/* frame-matched delay mode */
 	std::atomic<bool> sync_delay{false}; /* enable image-delay + audio sync */
+	/* Extra ring delay beyond the measured latency (frames). The post-cut depth
+	 * lands ~1 frame after the new-scene frames would reach the screen when the
+	 * delay equals the latency exactly, so the new scene's leading frames briefly
+	 * have no matching depth (a short 2D flash). A small margin makes the depth
+	 * win that race so a cut stays 3D, at the cost of a touch more latency. */
+	std::atomic<int> delay_margin{2};
 	uint64_t cur_capture_ns = 0;  /* capture timestamp of this render's frame */
 	uint64_t staged_ts[2] = {0, 0}; /* capture ts paired with each staging surface */
 	double delay_ema_ns = 0.0;    /* measured pipeline latency (capture->depth), LPF */
 	bool delay_ema_init = false;
 	uint64_t latency_epoch_ns = 0; /* reject latency samples from captures before the last resume */
 	int commit_delay = -1;        /* committed delay in frames (drives video+audio); -1 = unset */
+	int applied_delay = 0;        /* frames the image was actually delayed last render (debug log) */
 	uint64_t last_commit_ns = 0;  /* throttles re-commits so audio offset stays steady */
 	std::vector<gs_texture_t *> ring; /* recent full-res frames (delay line) */
 	std::vector<uint32_t> ring_gen;   /* scene generation tag per ring slot */
+	std::vector<uint64_t> ring_ts;    /* capture timestamp per ring slot (ns); 0 = unfilled */
 	int ring_w = 0, ring_h = 0;   /* ring slot dims (rebuild on source resize) */
 	int ring_widx = 0;            /* next slot to write */
 	int ring_filled = 0;          /* slots written so far (for warm-up) */
@@ -228,6 +282,7 @@ static void free_delay_ring(real3d_filter *f)
 			gs_texture_destroy(t);
 	f->ring.clear();
 	f->ring_gen.clear();
+	f->ring_ts.clear();
 	f->ring_w = f->ring_h = 0;
 	f->ring_widx = f->ring_filled = 0;
 }
@@ -246,6 +301,7 @@ static void ensure_delay_ring(real3d_filter *f, uint32_t w, uint32_t h, int slot
 	free_delay_ring(f);
 	f->ring.resize((size_t)slots, nullptr);
 	f->ring_gen.assign((size_t)slots, 0);
+	f->ring_ts.assign((size_t)slots, 0);
 	for (int i = 0; i < slots; ++i)
 		f->ring[i] = gs_texture_create(w, h, GS_RGBA, 1, nullptr,
 					       GS_RENDER_TARGET);
@@ -253,6 +309,98 @@ static void ensure_delay_ring(real3d_filter *f, uint32_t w, uint32_t h, int slot
 	f->ring_h = (int)h;
 	f->ring_widx = 0;
 	f->ring_filled = 0;
+}
+
+/* Destroy the depth cache. Caller must hold the graphics context. */
+static void free_depth_cache(real3d_filter *f)
+{
+	for (depth_slot &s : f->depth_cache)
+		if (s.tex)
+			gs_texture_destroy(s.tex);
+	f->depth_cache.clear();
+	f->depth_widx = 0;
+}
+
+/* Grow the depth cache to `slots` R32F textures (INFER_W x INFER_H). Append-only:
+ * existing slots (and their cached gen/ts/valid) are kept so a grow doesn't drop
+ * depths mid-stream; dims never change so it never rebuilds. Caller holds the
+ * graphics context. */
+static void ensure_depth_cache(real3d_filter *f, int slots)
+{
+	if (slots < 2)
+		slots = 2;
+	if (slots > DEPTH_CACHE_MAX)
+		slots = DEPTH_CACHE_MAX;
+	const int have = (int)f->depth_cache.size();
+	if (have >= slots)
+		return;
+	f->depth_cache.resize((size_t)slots);
+	for (int i = have; i < slots; ++i) {
+		depth_slot &s = f->depth_cache[i];
+		s.tex = gs_texture_create(INFER_W, INFER_H, GS_R32F, 1, nullptr,
+					  GS_DYNAMIC);
+		s.gen = 0;
+		s.ts = 0;
+		s.valid = false;
+	}
+}
+
+/* How many depth slots are needed to keep the depth matching the oldest shown
+ * (delayed) frame from being evicted before it is displayed. While that frame is
+ * in the ring (commit_delay frames), new depths keep arriving and overwriting
+ * cache slots; production is capped at one per canvas frame, so over the delay
+ * window at most `delay_frames * interval / max(infer_interval, interval)` depths
+ * land. Plus a margin, clamped to the cap. Minimum 3 so non-delay mode keeps the
+ * latest depth plus a little history for timestamp matching. */
+static int wanted_depth_slots(const real3d_filter *f, uint64_t interval_ns)
+{
+	/* The shown frame is delayed by commit_delay + the margin, so the cache must
+	 * cover that whole window (see wanted ring delay in render). */
+	int delay_frames = f->commit_delay < 0
+				   ? 0
+				   : f->commit_delay +
+					     f->delay_margin.load(std::memory_order_relaxed);
+	if (delay_frames > DELAY_RING_MAX - 1)
+		delay_frames = DELAY_RING_MAX - 1; /* effective delay is ring-bound */
+	int slots = 3;
+	const uint64_t infer_ns =
+		f->infer_interval_ns.load(std::memory_order_relaxed);
+	if (interval_ns && infer_ns && delay_frames > 0) {
+		const uint64_t eff = infer_ns > interval_ns ? infer_ns : interval_ns;
+		const double depths =
+			(double)delay_frames * (double)interval_ns / (double)eff;
+		const int need = (int)(depths + 0.999) + DEPTH_CACHE_MARGIN;
+		if (need > slots)
+			slots = need;
+	}
+	if (slots > DEPTH_CACHE_MAX)
+		slots = DEPTH_CACHE_MAX;
+	return slots;
+}
+
+/* Pick the cached depth for the frame being shown: scene generation must match
+ * exactly (never warp across a cut), then the nearest capture timestamp within
+ * that scene. Returns the flat fallback (and sets found=false) when nothing
+ * matches -- the caller then holds the disparity flat (2D). Graphics thread. */
+static gs_texture_t *pick_depth(real3d_filter *f, uint32_t shown_gen,
+				uint64_t shown_ts, bool &found)
+{
+	int best = -1;
+	uint64_t best_dt = 0;
+	for (int i = 0; i < f->depth_used; ++i) {
+		const depth_slot &s = f->depth_cache[i];
+		if (!s.valid || s.gen != shown_gen)
+			continue;
+		const uint64_t dt = shown_ts > s.ts ? shown_ts - s.ts
+						    : s.ts - shown_ts;
+		if (best < 0 || dt < best_dt) {
+			best = i;
+			best_dt = dt;
+		}
+	}
+	found = best >= 0;
+	f->depth_match_dt = found ? best_dt : 0; /* debug: how close the match was (ns) */
+	return found ? f->depth_cache[best].tex : f->depth_flat;
 }
 
 /* Restore the parent's audio sync offset we took over and reset the delay
@@ -294,6 +442,7 @@ static void worker_fn(real3d_filter *f)
 	for (;;) {
 		uint32_t gen = 0;
 		uint64_t ts = 0;
+		uint64_t submit = 0;
 		{
 			std::unique_lock<std::mutex> lk(f->m);
 			f->cv.wait(lk, [&] { return f->input_ready || f->stop; });
@@ -302,6 +451,7 @@ static void worker_fn(real3d_filter *f)
 			local_in.swap(f->in_buf);
 			gen = f->in_gen; /* which cut generation this frame belongs to */
 			ts = f->in_ts;   /* capture timestamp, for the delay-mode latency measure */
+			submit = f->in_submit_ns; /* when it was queued, for the wait measure */
 			f->input_ready = false;
 		}
 		const bool temporal = f->ort.temporal.load(std::memory_order_relaxed);
@@ -309,6 +459,7 @@ static void worker_fn(real3d_filter *f)
 			(TemporalMode)f->ort.temporal_mode.load(std::memory_order_relaxed);
 
 		/* raw ONNX depth -> normalise + flow-guided temporal stabilise */
+		const uint64_t run_start = os_gettime_ns();
 		if (f->ort.Run(local_in.data(), raw)) {
 			f->flow.process(
 				local_in.data(),
@@ -316,11 +467,17 @@ static void worker_fn(real3d_filter *f)
 				temporal, temporal_mode,
 				f->ort.stab_strength.load(std::memory_order_relaxed),
 				f->ort.depth_smooth.load(std::memory_order_relaxed) * 6.0f);
+			const uint64_t done = os_gettime_ns();
 			{
 				std::lock_guard<std::mutex> lk(f->m);
 				f->depth_buf.swap(stab);
 				f->out_gen = gen; /* tag the result with its cut generation */
 				f->out_ts = ts;   /* ...and the frame's capture timestamp */
+				/* latency decomposition (debug): how long it sat queued before
+				 * the worker picked it up, and how long the compute itself took. */
+				f->out_wait_ns =
+					run_start > submit ? run_start - submit : 0;
+				f->out_compute_ns = done - run_start;
 				f->depth_ready = true;
 			}
 			f->ort_live.store(true, std::memory_order_relaxed);
@@ -379,12 +536,20 @@ static void real3d_update(void *data, obs_data_t *s)
 	f->ort.depth_smooth.store((float)obs_data_get_double(s, "depth_smooth"),
 				  std::memory_order_relaxed);
 	f->show_depth.store(obs_data_get_bool(s, "show_depth"), rel);
+	f->debug_overlay.store(obs_data_get_bool(s, "debug_overlay"), rel);
+	f->debug_cache1.store(obs_data_get_bool(s, "debug_cache1"), rel);
 
 	/* Frame-matched delay: just record intent here; acquiring/releasing the
 	 * parent's audio sync offset and (re)building the frame ring happen on the
 	 * graphics thread in real3d_video_render, where the parent is always valid. */
 	f->sync_delay.store(obs_data_get_bool(s, "sync_delay"),
 			    std::memory_order_relaxed);
+	long long margin = obs_data_get_int(s, "delay_margin");
+	if (margin < 0)
+		margin = 0;
+	if (margin > 4)
+		margin = 4;
+	f->delay_margin.store((int)margin, std::memory_order_relaxed);
 }
 
 static void *real3d_create(obs_data_t *settings, obs_source_t *context)
@@ -408,6 +573,7 @@ static void *real3d_create(obs_data_t *settings, obs_source_t *context)
 		f->p_eyefit = gs_effect_get_param_by_name(f->effect, "eye_fit");
 		f->p_dither = gs_effect_get_param_by_name(f->effect, "dither");
 		f->p_outsize = gs_effect_get_param_by_name(f->effect, "out_size");
+		f->p_debug = gs_effect_get_param_by_name(f->effect, "debug_tint");
 	}
 	f->rt_full = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
 	f->rt_pre[0] = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
@@ -416,9 +582,9 @@ static void *real3d_create(obs_data_t *settings, obs_source_t *context)
 	f->stage[0] = gs_stagesurface_create(INFER_W, INFER_H, GS_RGBA);
 	f->stage[1] = gs_stagesurface_create(INFER_W, INFER_H, GS_RGBA);
 	std::vector<float> half((size_t)INFER_W * INFER_H, 0.5f);
-	f->depth_tex = gs_texture_create(INFER_W, INFER_H, GS_R32F, 1,
-					 nullptr, GS_DYNAMIC);
-	gs_texture_set_image(f->depth_tex, (const uint8_t *)half.data(),
+	f->depth_flat = gs_texture_create(INFER_W, INFER_H, GS_R32F, 1,
+					  nullptr, GS_DYNAMIC);
+	gs_texture_set_image(f->depth_flat, (const uint8_t *)half.data(),
 			     INFER_W * sizeof(float), false);
 	obs_leave_graphics();
 
@@ -458,6 +624,7 @@ static void real3d_destroy(void *data)
 	}
 	obs_enter_graphics();
 	free_delay_ring(f);
+	free_depth_cache(f);
 	if (f->effect)
 		gs_effect_destroy(f->effect);
 	if (f->rt_full)
@@ -472,8 +639,8 @@ static void real3d_destroy(void *data)
 		gs_stagesurface_destroy(f->stage[0]);
 	if (f->stage[1])
 		gs_stagesurface_destroy(f->stage[1]);
-	if (f->depth_tex)
-		gs_texture_destroy(f->depth_tex);
+	if (f->depth_flat)
+		gs_texture_destroy(f->depth_flat);
 	obs_leave_graphics();
 	delete f;
 }
@@ -599,8 +766,17 @@ static obs_properties_t *real3d_properties(void *data)
 					    obs_module_text("edgesoft"), 0.0, 1.0,
 					    0.05);
 	obs_property_set_long_description(q, obs_module_text("edgesoft.desc"));
-	q = obs_properties_add_bool(gst, "sync_delay",
-				    obs_module_text("syncdelay"));
+	/* Frame-matched delay is the parent toggle; the margin only matters while it
+	 * is on, so it sits inside the checkable group and is disabled in place when
+	 * delay is off (same idiom as skip_static / temporal above). The group's
+	 * checkbox is stored under "sync_delay" -- same key as the old bool, so
+	 * update()/defaults() are unchanged. */
+	obs_properties_t *g_delay = obs_properties_create();
+	q = obs_properties_add_int_slider(g_delay, "delay_margin",
+					  obs_module_text("delaymargin"), 0, 4, 1);
+	obs_property_set_long_description(q, obs_module_text("delaymargin.desc"));
+	q = obs_properties_add_group(gst, "sync_delay", obs_module_text("syncdelay"),
+				     OBS_GROUP_CHECKABLE, g_delay);
 	obs_property_set_long_description(q, obs_module_text("syncdelay.desc"));
 	obs_properties_add_group(p, "grp_stab", obs_module_text("group.stab"),
 				 OBS_GROUP_NORMAL, gst);
@@ -610,6 +786,12 @@ static obs_properties_t *real3d_properties(void *data)
 	q = obs_properties_add_bool(gdbg, "show_depth",
 				    obs_module_text("showdepth"));
 	obs_property_set_long_description(q, obs_module_text("showdepth.desc"));
+	q = obs_properties_add_bool(gdbg, "debug_overlay",
+				    obs_module_text("debugoverlay"));
+	obs_property_set_long_description(q, obs_module_text("debugoverlay.desc"));
+	q = obs_properties_add_bool(gdbg, "debug_cache1",
+				    obs_module_text("debugcache1"));
+	obs_property_set_long_description(q, obs_module_text("debugcache1.desc"));
 	obs_properties_add_group(p, "grp_dbg", obs_module_text("group.debug"),
 				 OBS_GROUP_NORMAL, gdbg);
 
@@ -632,7 +814,10 @@ static void real3d_defaults(obs_data_t *s)
 	obs_data_set_default_double(s, "stabilize_strength", 0.4);
 	obs_data_set_default_double(s, "depth_smooth", 0.3);
 	obs_data_set_default_bool(s, "sync_delay", false);
+	obs_data_set_default_int(s, "delay_margin", 2);
 	obs_data_set_default_bool(s, "show_depth", false);
+	obs_data_set_default_bool(s, "debug_overlay", false);
+	obs_data_set_default_bool(s, "debug_cache1", false);
 }
 
 /* Per-eye target resolution: match the source, or a fixed preset (e.g. 1080p so
@@ -829,10 +1014,27 @@ static void maybe_submit_inference(real3d_filter *f, gs_texture_t *full)
 
 	if (cut) {
 		/* Just advance the generation and refresh the depth ASAP. The flat
-		 * hold is derived at warp time from shown_gen != depth_gen, so it
-		 * engages exactly when the post-cut frame reaches the screen (which,
-		 * in delay mode, is several frames after this detection). */
+		 * hold is derived at warp time from "no cached depth matches the shown
+		 * frame", so it engages exactly when an unmatched post-cut frame reaches
+		 * the screen (which, in delay mode, is several frames after this). */
 		f->scene_gen++;
+		/* Cut detection lags by ~1 frame (the mapped readback is one detect-tick
+		 * old), so new-scene frames captured before this point are already in the
+		 * delay ring tagged with the *old* generation. Re-tag every ring frame at
+		 * or after the detected cut's capture time so the delayed display still
+		 * pairs them with the new scene's depth (unfilled slots have ts 0 < any
+		 * real ts, so they're left alone). Empty ring (delay off) -> no-op. */
+		for (int i = 0; i < (int)f->ring.size(); ++i)
+			if (f->ring_ts[i] >= readback_ts)
+				f->ring_gen[i] = f->scene_gen;
+		if (f->debug_overlay.load(std::memory_order_relaxed))
+			blog(LOG_INFO, "[near-real3d] cut detected -> gen %u "
+				       "(mad %.0f) [delay %d = commit %d + margin %d, "
+				       "cache %d]",
+			     f->scene_gen, cut_mad, f->applied_delay,
+			     f->commit_delay,
+			     f->delay_margin.load(std::memory_order_relaxed),
+			     f->depth_used);
 		f->settle_left = SETTLE_FRAMES;
 		f->prev_in = tight; /* fresh static-skip baseline for the new scene */
 		f->last_submit_ns = now;
@@ -841,6 +1043,7 @@ static void maybe_submit_inference(real3d_filter *f, gs_texture_t *full)
 			f->in_buf = tight; /* overwrite any unconsumed queued (stale) frame */
 			f->in_gen = f->scene_gen;
 			f->in_ts = readback_ts;
+			f->in_submit_ns = now;
 			f->input_ready = true;
 		}
 		f->cv.notify_one();
@@ -863,7 +1066,7 @@ static void maybe_submit_inference(real3d_filter *f, gs_texture_t *full)
 	 * keeps doing the cheap readback at the depth rate but skips the ONNX pass. */
 	f->last_submit_ns = now;
 
-	/* Static-frame skip: reuse the depth already in depth_tex when this frame
+	/* Static-frame skip: reuse the depth already cached when this frame
 	 * barely differs from the last one we inferred. But after motion stops we keep
 	 * inferring for SETTLE_FRAMES so the temporal blend converges to its ghost-free
 	 * steady state *before* freezing -- without this, a motion trail or post-cut
@@ -890,6 +1093,7 @@ static void maybe_submit_inference(real3d_filter *f, gs_texture_t *full)
 		f->in_buf = tight;
 		f->in_gen = f->scene_gen;
 		f->in_ts = readback_ts;
+		f->in_submit_ns = now;
 		f->input_ready = true;
 	}
 	f->cv.notify_one();
@@ -936,6 +1140,17 @@ static void real3d_video_render(void *data, gs_effect_t *)
 		f->latency_epoch_ns = now;
 	}
 
+	/* Canvas frame interval (ns): drives the delay-frame commit, the audio offset,
+	 * and the depth-cache sizing. Computed once here so the depth upload below can
+	 * size the cache before the delay block runs. */
+	uint64_t interval_ns = 0;
+	{
+		struct obs_video_info ovi;
+		if (obs_get_video_info(&ovi) && ovi.fps_num)
+			interval_ns = (uint64_t)ovi.fps_den * 1000000000ULL /
+				      (uint64_t)ovi.fps_num;
+	}
+
 	capture_input(f, w, h, space);
 	gs_texture_t *full = gs_texrender_get_texture(f->rt_full);
 	if (!full)
@@ -948,24 +1163,48 @@ static void real3d_video_render(void *data, gs_effect_t *)
 		std::vector<float> got;
 		uint32_t got_gen = 0;
 		uint64_t got_ts = 0;
+		uint64_t got_wait = 0, got_compute = 0;
 		{
 			std::lock_guard<std::mutex> lk(f->m);
 			if (f->depth_ready) {
 				got.swap(f->depth_buf);
 				got_gen = f->out_gen;
 				got_ts = f->out_ts;
+				got_wait = f->out_wait_ns;
+				got_compute = f->out_compute_ns;
 				f->depth_ready = false;
 			}
 		}
-		if (!got.empty()) {
-			gs_texture_set_image(f->depth_tex,
-					     (const uint8_t *)got.data(),
+		/* Size the depth cache every frame so the delay-driven slot count and the
+		 * debug 1-slot toggle take effect promptly. depth_used is the effective
+		 * live window (<= allocated): the debug toggle forces it to 1, reproducing
+		 * the pre-cache "latest depth only" behaviour for an instant A/B without
+		 * reallocating (allocation is append-only; we just read/write fewer slots). */
+		const int want_slots =
+			f->debug_cache1.load(std::memory_order_relaxed)
+				? 1
+				: wanted_depth_slots(f, interval_ns);
+		ensure_depth_cache(f, want_slots);
+		const int cap = (int)f->depth_cache.size();
+		f->depth_used = want_slots < cap ? want_slots : cap;
+		if (f->depth_used < 1)
+			f->depth_used = 1;
+		if (f->depth_widx >= f->depth_used)
+			f->depth_widx = 0;
+
+		if (!got.empty() && !f->depth_cache.empty()) {
+			/* Store into the next live slot (round-robin), tagged with the
+			 * scene generation and source capture timestamp it was computed for,
+			 * so the warp can later pick the depth matching the frame it shows. */
+			depth_slot &s = f->depth_cache[f->depth_widx];
+			gs_texture_set_image(s.tex, (const uint8_t *)got.data(),
 					     INFER_W * sizeof(float), false);
-			/* Record which scene this depth belongs to. The warp trusts the
-			 * depth (lets the disparity ramp back) once the frame being shown
-			 * is no newer than depth_gen; a stale pre-cut result is uploaded
-			 * but the disparity stays flat until the matching depth lands. */
-			f->depth_gen = got_gen;
+			s.gen = got_gen;
+			s.ts = got_ts;
+			s.valid = true;
+			f->depth_widx = (f->depth_widx + 1) % f->depth_used;
+		}
+		if (!got.empty()) {
 			/* Measure the capture->depth pipeline latency (LPF). This is how
 			 * far the image must be delayed in sync mode to match the depth.
 			 * Only measure while sync delay is ON: the EMA is unused otherwise,
@@ -990,24 +1229,41 @@ static void real3d_video_render(void *data, gs_effect_t *)
 					       "uploaded (%dx%d) - inference loop live",
 				     INFER_W, INFER_H);
 			}
+			/* Latency decomposition for the *first* depth of each generation
+			 * (post-cut that is the forced inference): shows where the cut-path
+			 * latency over `commit` goes. total = now - source capture ts =
+			 * stage/detect lag + queue wait + compute + render pickup; `other`
+			 * is the stage lag + pickup (everything outside the worker). */
+			if (got_gen != f->last_logged_depth_gen &&
+			    f->debug_overlay.load(std::memory_order_relaxed) &&
+			    got_ts && now > got_ts) {
+				f->last_logged_depth_gen = got_gen;
+				const double iv = interval_ns
+							  ? (double)interval_ns / 1e6
+							  : 16.667;
+				const double total = (double)(now - got_ts) / 1e6;
+				const double wait = (double)got_wait / 1e6;
+				const double comp = (double)got_compute / 1e6;
+				blog(LOG_INFO,
+				     "[near-real3d] depth gen %u latency %.1f ms "
+				     "(%.1f frames) = wait %.1f + compute %.1f + "
+				     "other %.1f | commit %d (%.1f ms)",
+				     got_gen, total, total / iv, wait, comp,
+				     total - wait - comp, f->commit_delay,
+				     (double)f->commit_delay * iv);
+			}
 		}
 	}
 
-	/* Frame-matched delay: pick which buffered frame to warp so it lines up with
-	 * the depth we currently have, and delay the source audio to match. When the
-	 * mode is off, release the audio sync and free the ring. shown_gen is the
-	 * scene generation of whatever frame we end up warping (the delayed ring
-	 * frame, or the current one when not delaying), used below to decide whether
-	 * the depth we hold matches it. */
+	/* Frame-matched delay: pick which buffered frame to warp, and delay the
+	 * source audio to match. When the mode is off, release the audio sync and
+	 * free the ring. shown_gen / shown_ts identify whatever frame we end up
+	 * warping (the delayed ring frame, or the current one when not delaying);
+	 * the warp uses them below to pick the matching cached depth. */
 	gs_texture_t *show = full;
 	uint32_t shown_gen = f->scene_gen;
+	uint64_t shown_ts = now;
 	{
-		struct obs_video_info ovi;
-		uint64_t interval_ns = 0;
-		if (obs_get_video_info(&ovi) && ovi.fps_num)
-			interval_ns = (uint64_t)ovi.fps_den * 1000000000ULL /
-				      (uint64_t)ovi.fps_num;
-
 		if (f->sync_delay.load(std::memory_order_relaxed)) {
 			/* take over the parent's audio sync offset once it's available */
 			if (!f->sync_owned) {
@@ -1043,7 +1299,16 @@ static void real3d_video_render(void *data, gs_effect_t *)
 					f->last_commit_ns = now;
 				}
 			}
-			const int want = f->commit_delay < 0 ? 0 : f->commit_delay;
+			/* Delay by the measured latency plus a small margin so the
+			 * post-cut depth reliably lands before the new-scene frames reach
+			 * the screen (otherwise their leading edge briefly has no matching
+			 * depth -- a short 2D flash). Margin only applies once a latency is
+			 * committed; audio follows via applied_d below, so it stays in sync. */
+			const int margin = f->commit_delay < 0
+						   ? 0
+						   : f->delay_margin.load(
+							     std::memory_order_relaxed);
+			const int want = (f->commit_delay < 0 ? 0 : f->commit_delay) + margin;
 
 			ensure_delay_ring(f, w, h, want + 3);
 			const int n = (int)f->ring.size();
@@ -1054,17 +1319,20 @@ static void real3d_video_render(void *data, gs_effect_t *)
 					d = n - 1;
 				gs_copy_texture(f->ring[f->ring_widx], full);
 				f->ring_gen[f->ring_widx] = f->scene_gen;
+				f->ring_ts[f->ring_widx] = now;
 				if (d > 0 && f->ring_filled >= d) {
 					const int idx =
 						(f->ring_widx - d + n) % n;
 					show = f->ring[idx];
 					shown_gen = f->ring_gen[idx];
+					shown_ts = f->ring_ts[idx];
 					applied_d = d;
 				}
 				f->ring_widx = (f->ring_widx + 1) % n;
 				if (f->ring_filled < n)
 					f->ring_filled++;
 			}
+			f->applied_delay = applied_d; /* for the debug log */
 
 			/* Audio delay = the frames the image is actually delayed (0 during
 			 * ring warm-up). Because `applied_d` is driven by the committed,
@@ -1086,31 +1354,61 @@ static void real3d_video_render(void *data, gs_effect_t *)
 			release_audio_sync(f);
 			if (!f->ring.empty())
 				free_delay_ring(f);
+			f->applied_delay = 0; /* not delaying */
 		}
 	}
 
+	/* Pick the cached depth matching the frame we are about to warp (same scene
+	 * generation, nearest capture timestamp). In delay mode this keeps the prior
+	 * scene's tail in 3D across a cut -- its depth is still cached for the prior-
+	 * scene frames the ring is still showing -- and only the genuinely unmatched
+	 * frames (no depth for that scene yet: pre-warm-up, a forced post-cut depth
+	 * not landed, continuous cuts) fall back to 2D. */
+	bool depth_found = false;
+	gs_texture_t *depth_show = pick_depth(f, shown_gen, shown_ts, depth_found);
+
 	/* Scene-cut disparity fade. Flatten to 2D whenever the frame we are about to
-	 * warp (shown_gen) and the depth we hold (depth_gen) are from different
-	 * scenes -- warping across a cut is the glitch we are avoiding. depth_tex
-	 * holds only the latest depth, so a mismatch in *either* direction is unsafe:
-	 *   shown_gen > depth_gen : the post-cut frame's depth hasn't arrived yet.
-	 *   shown_gen < depth_gen : (delay mode) the forced post-cut inference landed
-	 *     the next scene's depth while the ring is still showing the prior scene,
-	 *     and that scene's matching depth has already been overwritten.
-	 * Once the two line up, ramp back to full over ~1/DISP_RAMP_PER_SEC s so the
-	 * 3D returns without a pop. A failsafe lifts the hold if they never converge
-	 * (e.g. inference failure) so the filter can't get stuck flat. */
+	 * warp has no matching cached depth -- warping it with another scene's depth
+	 * is the glitch we are avoiding. Once a match exists, ramp back to full over
+	 * ~1/DISP_RAMP_PER_SEC s so the 3D returns without a pop. A failsafe lifts the
+	 * hold if a match never appears (e.g. inference failure) so the filter can't
+	 * get stuck flat. */
 	{
-		const bool depth_stale = shown_gen != f->depth_gen;
+		const bool dbg = f->debug_overlay.load(std::memory_order_relaxed);
+		const bool depth_stale = !depth_found;
 		if (depth_stale) {
-			if (!f->stale_since_ns)
-				f->stale_since_ns = now;
+			if (!f->stale_since_ns) {
+				f->stale_since_ns = now; /* flat hold begins */
+				f->stale_logged = false;
+			}
 		} else {
+			/* Flat hold ended by a genuine match: log how long the 2D
+			 * fallback (red) lasted and how close the recovering depth was. */
+			if (f->stale_since_ns && dbg)
+				blog(LOG_INFO, "[near-real3d] flat hold ended: %.1f ms "
+					       "(gen %u, depth ts_delta %.1f ms) "
+					       "[delay %d = commit %d + margin %d, "
+					       "cache %d]",
+				     (double)(now - f->stale_since_ns) / 1e6,
+				     shown_gen, (double)f->depth_match_dt / 1e6,
+				     f->applied_delay, f->commit_delay,
+				     f->delay_margin.load(std::memory_order_relaxed),
+				     f->depth_used);
 			f->stale_since_ns = 0;
 		}
 		const bool failsafe =
 			f->stale_since_ns &&
 			now - f->stale_since_ns > FLATTEN_TIMEOUT_NS;
+		if (failsafe && dbg && !f->stale_logged) {
+			blog(LOG_WARNING, "[near-real3d] flat hold > %.0f ms without "
+					  "matching depth -> failsafe lifting (gen %u) "
+					  "[delay %d = commit %d + margin %d, cache %d]",
+			     (double)FLATTEN_TIMEOUT_NS / 1e6, shown_gen,
+			     f->applied_delay, f->commit_delay,
+			     f->delay_margin.load(std::memory_order_relaxed),
+			     f->depth_used);
+			f->stale_logged = true;
+		}
 		const float dt = f->last_render_ns
 					 ? (float)(now - f->last_render_ns) * 1e-9f
 					 : 0.0f;
@@ -1138,13 +1436,27 @@ static void real3d_video_render(void *data, gs_effect_t *)
 		gs_effect_set_texture(f->p_image, show);
 	const auto rel = std::memory_order_relaxed;
 	const bool full_sbs = f->full_sbs.load(rel);
-	gs_effect_set_texture(f->p_depthtex, f->depth_tex);
+	gs_effect_set_texture(f->p_depthtex, depth_show);
 	gs_effect_set_float(f->p_strength, f->frac.load(rel) * f->disp_scale);
 	gs_effect_set_float(f->p_conv, f->convergence.load(rel));
 	gs_effect_set_float(f->p_swap, f->swap_sign.load(rel));
 	gs_effect_set_float(f->p_usedepth,
 			    (f->ort_ok && f->ort_live.load(rel)) ? 1.0f : 0.0f);
 	gs_effect_set_float(f->p_showdepth, f->show_depth.load(rel) ? 1.0f : 0.0f);
+
+	/* Debug overlay: only meaningful while the ONNX depth path is live (in the
+	 * luminance fallback the warp is 3D regardless of the cache, so the match
+	 * state would mislead). 1 = no matching cached depth (red, 2D fallback),
+	 * 2 = matched but disparity still ramping (yellow), 0 = full 3D / off. */
+	float dbg = 0.0f;
+	if (f->debug_overlay.load(rel) && f->ort_ok && f->ort_live.load(rel)) {
+		if (!depth_found)
+			dbg = 1.0f;
+		else if (f->disp_scale < 0.999f)
+			dbg = 2.0f;
+	}
+	if (f->p_debug)
+		gs_effect_set_float(f->p_debug, dbg);
 
 	/* per-eye target size + optional aspect-fit (letterbox) of the source */
 	uint32_t eyeW, eyeH;
