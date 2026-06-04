@@ -272,6 +272,15 @@ struct real3d_filter {
 		* Undo restore_filters clears filter_parent before our destroy runs) */
 	int64_t saved_sync = 0;       /* user's sync offset, restored on disable/destroy */
 	int64_t applied_extra = -1;   /* audio delay we last applied (ns); -1 = none */
+	/* Anti-compounding: OBS persists the parent's sync_offset, so the `extra` we
+	 * add leaks into the saved value and (re-read as a baseline next session)
+	 * would compound. sync_leak_ns is how much of the parent's *current* offset is
+	 * our addition; the filter's save callback persists it, and on the next load
+	 * we subtract it back out (load_leak_ns, applied once) to recover the user's
+	 * true baseline. atomic: written on the graphics thread, read by save (UI). */
+	std::atomic<int64_t> sync_leak_ns{0};
+	int64_t load_leak_ns = 0;     /* our leak persisted last session (to subtract) */
+	bool load_leak_pending = true; /* do the one-time on-load correction */
 };
 
 /* Destroy the delay ring. Caller must hold the graphics context. */
@@ -422,10 +431,18 @@ static void release_audio_sync(real3d_filter *f)
 		obs_source_t *parent = obs_weak_source_get_source(f->sync_parent);
 		if (parent) {
 			obs_source_set_sync_offset(parent, f->saved_sync);
+			if (f->debug_overlay.load(std::memory_order_relaxed))
+				blog(LOG_INFO,
+				     "[near-real3d] audio sync released: restored parent "
+				     "offset to %.1f ms",
+				     (double)f->saved_sync / 1e6);
 			obs_source_release(parent);
 		}
 	}
 	f->sync_owned = false;
+	/* Our delay no longer rides the parent's offset, so nothing of ours is left in
+	 * the persisted value (we restored the true baseline above). */
+	f->sync_leak_ns.store(0, std::memory_order_relaxed);
 	if (f->sync_parent) {
 		obs_weak_source_release(f->sync_parent);
 		f->sync_parent = nullptr;
@@ -610,6 +627,11 @@ static void *real3d_create(obs_data_t *settings, obs_source_t *context)
 
 	if (f->ort_ok)
 		f->worker = std::thread(worker_fn, f);
+
+	/* How much of the parent's persisted sync offset is our leftover audio delay
+	 * from last session (written by real3d_save). The first render subtracts it so
+	 * we recover the user's true baseline instead of compounding on it. */
+	f->load_leak_ns = obs_data_get_int(settings, "sync_leak_ns");
 
 	real3d_update(f, settings);
 	blog(LOG_INFO, "[near-real3d] filter created (effect=%s, depth=%s)",
@@ -825,6 +847,16 @@ static void real3d_defaults(obs_data_t *s)
 	obs_data_set_default_bool(s, "show_depth", false);
 	obs_data_set_default_bool(s, "debug_overlay", false);
 	obs_data_set_default_bool(s, "debug_cache1", false);
+}
+
+/* Persist how much of the parent's (also-persisted) audio sync offset is our
+ * delay, so the next load can subtract it and recover the user's true baseline
+ * instead of compounding on it. Called by OBS when saving the scene collection. */
+static void real3d_save(void *data, obs_data_t *settings)
+{
+	auto *f = static_cast<real3d_filter *>(data);
+	obs_data_set_int(settings, "sync_leak_ns",
+			 f->sync_leak_ns.load(std::memory_order_relaxed));
 }
 
 /* Per-eye target resolution: match the source, or a fixed preset (e.g. 1080p so
@@ -1271,6 +1303,35 @@ static void real3d_video_render(void *data, gs_effect_t *)
 	uint32_t shown_gen = f->scene_gen;
 	uint64_t shown_ts = now;
 	{
+		/* One-time on-load correction (runs regardless of delay state): OBS
+		 * persisted our last-session audio delay into the parent's sync offset.
+		 * Subtract what real3d_save recorded so the user's true baseline is
+		 * restored and we never compound on it. Clamp to the offset's own
+		 * non-negative magnitude so a manual reset between sessions (which
+		 * cleared the leak) can't over-correct into a spurious negative offset. */
+		if (f->load_leak_pending) {
+			f->load_leak_pending = false;
+			obs_source_t *parent = obs_filter_get_parent(f->context);
+			if (parent && f->load_leak_ns != 0) {
+				const int64_t cur = obs_source_get_sync_offset(parent);
+				int64_t corr = f->load_leak_ns;
+				const int64_t cap = cur > 0 ? cur : 0;
+				if (corr > cap)
+					corr = cap;
+				if (corr > 0) {
+					obs_source_set_sync_offset(parent, cur - corr);
+					if (f->debug_overlay.load(std::memory_order_relaxed))
+						blog(LOG_INFO,
+						     "[near-real3d] audio leak corrected on "
+						     "load: %.1f -> %.1f ms (removed %.1f)",
+						     (double)cur / 1e6,
+						     (double)(cur - corr) / 1e6,
+						     (double)corr / 1e6);
+				}
+			}
+			f->load_leak_ns = 0;
+		}
+
 		if (f->sync_delay.load(std::memory_order_relaxed)) {
 			/* take over the parent's audio sync offset once it's available */
 			if (!f->sync_owned) {
@@ -1287,6 +1348,16 @@ static void real3d_video_render(void *data, gs_effect_t *)
 						obs_source_get_weak_source(parent);
 					f->applied_extra = -1;
 					f->sync_owned = true;
+					/* DIAGNOSTIC: the offset we read here is treated as the
+					 * user's baseline. If it is non-zero on a fresh start (or
+					 * grows across restarts after resetting it to 0), our delay
+					 * leaked into OBS's persisted "sync" and is compounding. */
+					if (f->debug_overlay.load(std::memory_order_relaxed))
+						blog(LOG_INFO,
+						     "[near-real3d] audio sync acquired: "
+						     "parent offset at takeover = %.1f ms "
+						     "(used as baseline)",
+						     (double)f->saved_sync / 1e6);
 				}
 			}
 
@@ -1346,11 +1417,27 @@ static void real3d_video_render(void *data, gs_effect_t *)
 					? (int64_t)applied_d * (int64_t)interval_ns
 					: 0;
 			if (f->sync_owned && extra != f->applied_extra) {
+				/* Record our leak BEFORE writing the parent offset. If a
+				 * scene-collection save (UI thread) interleaves between the two
+				 * writes, the persisted leak is then never *smaller* than the
+				 * leak baked into the persisted offset, so the next load
+				 * over-removes (bounded harmless by the load-time clamp) instead
+				 * of under-removing -- the latter would re-introduce compounding.
+				 * Release uses the mirror order (restore offset, then zero leak)
+				 * for the same safe-direction reason. */
+				f->sync_leak_ns.store(extra, std::memory_order_relaxed);
 				obs_source_t *parent =
 					obs_filter_get_parent(f->context);
 				if (parent)
 					obs_source_set_sync_offset(
 						parent, f->saved_sync + extra);
+				if (f->debug_overlay.load(std::memory_order_relaxed))
+					blog(LOG_INFO,
+					     "[near-real3d] audio offset set: baseline %.1f "
+					     "+ extra %.1f = %.1f ms (applied_d %d frames)",
+					     (double)f->saved_sync / 1e6,
+					     (double)extra / 1e6,
+					     (double)(f->saved_sync + extra) / 1e6, applied_d);
 				f->applied_extra = extra;
 			}
 		} else {
@@ -1728,6 +1815,7 @@ bool obs_module_load(void)
 	real3d_filter_info.create = real3d_create;
 	real3d_filter_info.destroy = real3d_destroy;
 	real3d_filter_info.update = real3d_update;
+	real3d_filter_info.save = real3d_save;
 	real3d_filter_info.get_properties = real3d_properties;
 	real3d_filter_info.get_defaults = real3d_defaults;
 	real3d_filter_info.get_width = real3d_get_width;
