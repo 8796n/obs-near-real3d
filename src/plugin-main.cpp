@@ -345,21 +345,28 @@ static void ensure_depth_cache(real3d_filter *f, int slots)
 	}
 }
 
+/* Effective delay window in frames = measured latency (commit_delay) + the user
+ * margin, or 0 until a latency is committed. This single value drives BOTH the
+ * video ring delay and the depth-cache sizing, which must agree -- if the cache
+ * covered fewer frames than the ring delays, the matching depth would be evicted
+ * before its frame is shown (a spurious 2D). Keep the formula here only. */
+static int wanted_delay_frames(const real3d_filter *f)
+{
+	if (f->commit_delay < 0)
+		return 0;
+	return f->commit_delay + f->delay_margin.load(std::memory_order_relaxed);
+}
+
 /* How many depth slots are needed to keep the depth matching the oldest shown
  * (delayed) frame from being evicted before it is displayed. While that frame is
- * in the ring (commit_delay frames), new depths keep arriving and overwriting
- * cache slots; production is capped at one per canvas frame, so over the delay
- * window at most `delay_frames * interval / max(infer_interval, interval)` depths
- * land. Plus a margin, clamped to the cap. Minimum 3 so non-delay mode keeps the
- * latest depth plus a little history for timestamp matching. */
+ * in the ring (the delay window), new depths keep arriving and overwriting cache
+ * slots; production is capped at one per canvas frame, so over the window at most
+ * `delay_frames * interval / max(infer_interval, interval)` depths land. Plus a
+ * margin, clamped to the cap. Minimum 3 so non-delay mode keeps the latest depth
+ * plus a little history for timestamp matching. */
 static int wanted_depth_slots(const real3d_filter *f, uint64_t interval_ns)
 {
-	/* The shown frame is delayed by commit_delay + the margin, so the cache must
-	 * cover that whole window (see wanted ring delay in render). */
-	int delay_frames = f->commit_delay < 0
-				   ? 0
-				   : f->commit_delay +
-					     f->delay_margin.load(std::memory_order_relaxed);
+	int delay_frames = wanted_delay_frames(f);
 	if (delay_frames > DELAY_RING_MAX - 1)
 		delay_frames = DELAY_RING_MAX - 1; /* effective delay is ring-bound */
 	int slots = 3;
@@ -1299,16 +1306,12 @@ static void real3d_video_render(void *data, gs_effect_t *)
 					f->last_commit_ns = now;
 				}
 			}
-			/* Delay by the measured latency plus a small margin so the
-			 * post-cut depth reliably lands before the new-scene frames reach
-			 * the screen (otherwise their leading edge briefly has no matching
-			 * depth -- a short 2D flash). Margin only applies once a latency is
-			 * committed; audio follows via applied_d below, so it stays in sync. */
-			const int margin = f->commit_delay < 0
-						   ? 0
-						   : f->delay_margin.load(
-							     std::memory_order_relaxed);
-			const int want = (f->commit_delay < 0 ? 0 : f->commit_delay) + margin;
+			/* Delay by the measured latency plus the margin (shared with the
+			 * depth-cache sizing) so the post-cut depth reliably lands before the
+			 * new-scene frames reach the screen -- otherwise their leading edge
+			 * briefly has no matching depth (a short 2D flash). Audio follows via
+			 * applied_d below, so it stays in sync. */
+			const int want = wanted_delay_frames(f);
 
 			ensure_delay_ring(f, w, h, want + 3);
 			const int n = (int)f->ring.size();
