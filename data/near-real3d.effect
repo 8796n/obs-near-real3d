@@ -24,6 +24,7 @@ uniform float show_depth;       // debug: 1 = output the depth map as grayscale
 uniform float2 eye_fit;         // source sub-rect in each eye; (1,1) = stretch-fill
 uniform float dither;           // output dither amount (mpv-grain scale); 0 = off
 uniform float2 out_size;        // SBS output resolution in px, for the dither seed
+uniform float debug_tint;       // debug overlay: 0 = off, 1 = 2D fallback (red), 2 = ramping (yellow)
 
 sampler_state linClamp {
 	Filter   = Linear;
@@ -111,6 +112,18 @@ float4 PSStereoSBS(VertData v_in) : TARGET
 		a = dith_rand(h); h = dith_perm(h);
 		b = dith_rand(h); h = dith_perm(h); n.z = a + b - 1.0;
 		col.rgb += amp * n;
+	}
+
+	// Debug overlay: tint the whole eye so the otherwise-invisible per-frame depth
+	// match state is visible in real time. Red = no cached depth matches the shown
+	// frame (warping flat / 2D fallback); yellow = a match exists but the disparity
+	// is still ramping back. No tint = full 3D with a matched depth, so colour only
+	// appears when something is actually happening (e.g. right after a hard cut).
+	if (debug_tint > 0.5) {
+		float3 tcol = (debug_tint < 1.5) ? float3(1.0, 0.0, 0.0)
+						 : float3(1.0, 0.85, 0.0);
+		float ta = (debug_tint < 1.5) ? 0.30 : 0.22;
+		col.rgb = lerp(col.rgb, tcol, ta);
 	}
 
 	col.rgb *= inside;
