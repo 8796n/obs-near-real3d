@@ -107,10 +107,16 @@ static const int DEPTH_CACHE_MARGIN = 2;         /* spare slots beyond the delay
 static const float DELAY_EMA = 0.85f;            /* latency low-pass (per inference) */
 /* The committed delay (frames) drives BOTH the video ring and the audio sync
  * offset. Video can change cheaply every frame, but changing the audio offset
- * makes OBS re-time the audio (an audible click), so we only re-commit when the
+ * makes OBS re-time the audio (it grows OBS's one-way "dynamically increasing"
+ * audio buffer, which never shrinks in-session), so we only re-commit when the
  * measured latency leaves a deadband around the current value AND a cooldown has
- * passed -- keeping the offset rock-steady in the steady state. */
-static const float COMMIT_DEADBAND = 0.75f;      /* frames: ignore sub-frame jitter */
+ * passed -- keeping the offset rock-steady in the steady state. The deadband is
+ * wider than 1 frame on purpose: when the true latency sits near a half-frame
+ * boundary (e.g. ~2.5f at 24 fps) a narrower band lets ordinary compute-time
+ * jitter limit-cycle the commit up/down each cooldown, and every up-swing
+ * ratchets the audio buffer. >1 frame holds the commit put; the margin + depth
+ * cache absorb the resulting <=1 frame of latency mismatch. */
+static const float COMMIT_DEADBAND = 1.5f;       /* frames: ignore up to ~1-frame jitter */
 static const uint64_t COMMIT_COOLDOWN_NS = 1500000000ULL; /* 1.5 s between re-commits */
 static_assert(COMMIT_DEADBAND > 0.5f, "deadband must exceed the rounding boundary");
 
