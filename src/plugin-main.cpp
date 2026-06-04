@@ -35,7 +35,7 @@
  * CMake (-DPLUGIN_VERSION, e.g. v0.3.1 for a tag build); the fallback below is
  * only used for IDE/standalone builds that don't define it. */
 #ifndef REAL3D_VERSION
-#define REAL3D_VERSION "0.3.1-dev"
+#define REAL3D_VERSION "0.3.2-dev"
 #endif
 #define REAL3D_BUILD_INFO \
 	("near Real 3D " REAL3D_VERSION "  (built " __DATE__ " " __TIME__ ")")
@@ -630,8 +630,12 @@ static void *real3d_create(obs_data_t *settings, obs_source_t *context)
 
 	/* How much of the parent's persisted sync offset is our leftover audio delay
 	 * from last session (written by real3d_save). The first render subtracts it so
-	 * we recover the user's true baseline instead of compounding on it. */
+	 * we recover the user's true baseline instead of compounding on it. Mirror it
+	 * into sync_leak_ns so that if OBS saves *before* that first render (source
+	 * hidden / not yet drawn), real3d_save re-persists the leak instead of 0 --
+	 * otherwise the subtraction info would be lost and the offset stuck inflated. */
 	f->load_leak_ns = obs_data_get_int(settings, "sync_leak_ns");
+	f->sync_leak_ns.store(f->load_leak_ns, std::memory_order_relaxed);
 
 	real3d_update(f, settings);
 	blog(LOG_INFO, "[near-real3d] filter created (effect=%s, depth=%s)",
@@ -1306,30 +1310,34 @@ static void real3d_video_render(void *data, gs_effect_t *)
 		/* One-time on-load correction (runs regardless of delay state): OBS
 		 * persisted our last-session audio delay into the parent's sync offset.
 		 * Subtract what real3d_save recorded so the user's true baseline is
-		 * restored and we never compound on it. Clamp to the offset's own
-		 * non-negative magnitude so a manual reset between sessions (which
-		 * cleared the leak) can't over-correct into a spurious negative offset. */
+		 * restored and we never compound on it. We only ever ADD a non-negative
+		 * delay, so we subtract straight (no clamp): this also recovers a
+		 * legitimately NEGATIVE user baseline (OBS allows down to -950 ms). Run
+		 * only once we can reach the parent so the leak isn't dropped if the very
+		 * first render happens before the source is attached. */
 		if (f->load_leak_pending) {
-			f->load_leak_pending = false;
 			obs_source_t *parent = obs_filter_get_parent(f->context);
-			if (parent && f->load_leak_ns != 0) {
-				const int64_t cur = obs_source_get_sync_offset(parent);
-				int64_t corr = f->load_leak_ns;
-				const int64_t cap = cur > 0 ? cur : 0;
-				if (corr > cap)
-					corr = cap;
-				if (corr > 0) {
-					obs_source_set_sync_offset(parent, cur - corr);
+			if (parent) {
+				f->load_leak_pending = false;
+				if (f->load_leak_ns > 0) {
+					const int64_t cur =
+						obs_source_get_sync_offset(parent);
+					obs_source_set_sync_offset(parent,
+								   cur - f->load_leak_ns);
 					if (f->debug_overlay.load(std::memory_order_relaxed))
 						blog(LOG_INFO,
 						     "[near-real3d] audio leak corrected on "
 						     "load: %.1f -> %.1f ms (removed %.1f)",
 						     (double)cur / 1e6,
-						     (double)(cur - corr) / 1e6,
-						     (double)corr / 1e6);
+						     (double)(cur - f->load_leak_ns) / 1e6,
+						     (double)f->load_leak_ns / 1e6);
 				}
+				/* Our leak is no longer in the parent offset. Store 0 AFTER the
+				 * offset write so a torn save errs toward over-removal (bounded,
+				 * non-compounding) rather than leaving the leak in. */
+				f->sync_leak_ns.store(0, std::memory_order_relaxed);
+				f->load_leak_ns = 0;
 			}
-			f->load_leak_ns = 0;
 		}
 
 		if (f->sync_delay.load(std::memory_order_relaxed)) {
@@ -1465,7 +1473,14 @@ static void real3d_video_render(void *data, gs_effect_t *)
 	 * get stuck flat. */
 	{
 		const bool dbg = f->debug_overlay.load(std::memory_order_relaxed);
-		const bool depth_stale = !depth_found;
+		/* Only the ONNX depth path uses the cache; in the luminance fallback
+		 * (model missing / init or runtime failure) the shader derives depth from
+		 * the image itself (use_depth_tex=0), so a cache miss must NOT flatten to
+		 * 2D there -- otherwise startup with a broken model shows flat until the
+		 * failsafe lifts. Treat "stale" as meaningful only while ONNX is live. */
+		const bool depth_active =
+			f->ort_ok && f->ort_live.load(std::memory_order_relaxed);
+		const bool depth_stale = depth_active && !depth_found;
 		if (depth_stale) {
 			if (!f->stale_since_ns) {
 				f->stale_since_ns = now; /* flat hold begins */
