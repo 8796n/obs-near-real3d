@@ -1417,15 +1417,20 @@ static void real3d_video_render(void *data, gs_effect_t *)
 					? (int64_t)applied_d * (int64_t)interval_ns
 					: 0;
 			if (f->sync_owned && extra != f->applied_extra) {
+				/* Record our leak BEFORE writing the parent offset. If a
+				 * scene-collection save (UI thread) interleaves between the two
+				 * writes, the persisted leak is then never *smaller* than the
+				 * leak baked into the persisted offset, so the next load
+				 * over-removes (bounded harmless by the load-time clamp) instead
+				 * of under-removing -- the latter would re-introduce compounding.
+				 * Release uses the mirror order (restore offset, then zero leak)
+				 * for the same safe-direction reason. */
+				f->sync_leak_ns.store(extra, std::memory_order_relaxed);
 				obs_source_t *parent =
 					obs_filter_get_parent(f->context);
 				if (parent)
 					obs_source_set_sync_offset(
 						parent, f->saved_sync + extra);
-				/* Record how much of the parent's offset is now ours so the
-				 * save callback can persist it and the next load subtracts it
-				 * back out (anti-compounding). */
-				f->sync_leak_ns.store(extra, std::memory_order_relaxed);
 				if (f->debug_overlay.load(std::memory_order_relaxed))
 					blog(LOG_INFO,
 					     "[near-real3d] audio offset set: baseline %.1f "
