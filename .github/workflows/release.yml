@@ -85,6 +85,8 @@ jobs:
         env:
           MODEL_URL: ${{ vars.MODEL_URL }}
           MODEL_SHA256: ${{ vars.MODEL_SHA256 }}
+          MODEL_LITE_URL: ${{ vars.MODEL_LITE_URL }}
+          MODEL_LITE_SHA256: ${{ vars.MODEL_LITE_SHA256 }}
           IS_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}
         run: |
           if (-not $env:MODEL_URL) {
@@ -106,6 +108,27 @@ jobs:
           } else {
             Write-Warning "MODEL_SHA256 not set - skipping model integrity check (non-tag build)"
           }
+          # Lightweight (224x126) model for the -lite variant. Optional: when
+          # MODEL_LITE_URL is unset the lite package is simply skipped, so the full
+          # release still builds. When set on a tag it must also be verified.
+          if ($env:MODEL_LITE_URL) {
+            if (($env:IS_TAG -eq 'true') -and (-not $env:MODEL_LITE_SHA256)) {
+              throw "Tag releases with MODEL_LITE_URL require MODEL_LITE_SHA256 to verify the lite model."
+            }
+            $lite = "models/dav2_224x126.onnx"
+            Invoke-WebRequest -Uri $env:MODEL_LITE_URL -OutFile $lite
+            if ($env:MODEL_LITE_SHA256) {
+              $got = (Get-FileHash $lite -Algorithm SHA256).Hash.ToLower()
+              if ($got -ne $env:MODEL_LITE_SHA256.ToLower()) {
+                throw "lite model SHA-256 mismatch: got $got, expected $($env:MODEL_LITE_SHA256)"
+              }
+              Write-Host "lite model SHA-256 verified"
+            } else {
+              Write-Warning "MODEL_LITE_SHA256 not set - skipping lite model integrity check (non-tag build)"
+            }
+          } else {
+            Write-Warning "MODEL_LITE_URL not set - the -lite variant will be skipped"
+          }
 
       - name: Configure + build
         env:
@@ -119,7 +142,14 @@ jobs:
       - name: Package (zip + installer)
         env:
           PLUGIN_VERSION: ${{ steps.ver.outputs.version }}
-        run: ./package.ps1 -Version $env:PLUGIN_VERSION
+        run: |
+          ./package.ps1 -Version $env:PLUGIN_VERSION -Variant full
+          # Lite variant only when its model was fetched above (MODEL_LITE_URL set).
+          if (Test-Path "models/dav2_224x126.onnx") {
+            ./package.ps1 -Version $env:PLUGIN_VERSION -Variant lite
+          } else {
+            Write-Warning "models/dav2_224x126.onnx absent -> skipping lite package"
+          }
 
       - name: Upload artifacts (every run)
         uses: actions/upload-artifact@v7

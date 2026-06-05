@@ -2,14 +2,24 @@
 ; Built by package.ps1 / CI. The staged plugin tree must exist at
 ;   ..\dist\stage\obs-near-real3d\{bin\64bit, data, ...}
 ; Pass the version with:  ISCC.exe /DAppVersion=0.3.1 obs-near-real3d.iss
+; Pass /DLite for the lightweight (224x126 model) build. Both variants share the
+; same AppId and install path, so installing one replaces the other (the DLL and
+; install dir are identical -- only the bundled model differs).
 
 #ifndef AppVersion
-  #define AppVersion "0.3.1-dev"
+  #define AppVersion "0.4.0-dev"
+#endif
+#ifdef Lite
+  #define VariantSuffix "-lite"
+  #define VariantLabel " Lite (224x126)"
+#else
+  #define VariantSuffix ""
+  #define VariantLabel ""
 #endif
 
 [Setup]
 AppId={{B7A3F1E2-4C5D-4A6B-9E8F-1A2B3C4D5E6F}
-AppName=near Real 3D (OBS plugin)
+AppName=near Real 3D{#VariantLabel} (OBS plugin)
 AppVersion={#AppVersion}
 AppPublisher=8796n
 AppPublisherURL=https://github.com/8796n/obs-near-real3d
@@ -22,8 +32,8 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 LicenseFile=..\LICENSE
 OutputDir=..\dist
-OutputBaseFilename=near-real3d-{#AppVersion}-windows-x64-installer
-UninstallDisplayName=near Real 3D (OBS plugin)
+OutputBaseFilename=near-real3d-{#AppVersion}{#VariantSuffix}-windows-x64-installer
+UninstallDisplayName=near Real 3D{#VariantLabel} (OBS plugin)
 WizardStyle=modern
 SolidCompression=yes
 ; Pick the wizard language from the OS UI language automatically (no prompt).
