@@ -166,6 +166,87 @@ inline void maxFilter(std::vector<float> &im, int w, int h, int r)
 		}
 }
 
+/* Replace the outermost `margin` px ring of the depth with the nearest interior
+ * value (replicate inward -> outward). Single-image depth models (DPT/ViT) emit
+ * an unreliable halo at the very image border regardless of content; repairing
+ * it here -- on the depth map only, never the displayed image -- keeps that halo
+ * out of both the warp and the range estimate, so arbitrary mixed input (UI /
+ * letterbox / black bars touching the frame edge) degrades gracefully instead of
+ * tearing. */
+inline void fixBorderRing(std::vector<float> &d, int w, int h, int margin)
+{
+	if (margin < 1 || w <= 2 * margin || h <= 2 * margin)
+		return;
+	for (int y = 0; y < h; ++y) {
+		const int cy = y < margin ? margin
+					  : (y >= h - margin ? h - 1 - margin : y);
+		for (int x = 0; x < w; ++x) {
+			const int cx = x < margin
+					       ? margin
+					       : (x >= w - margin ? w - 1 - margin : x);
+			if (cx == x && cy == y)
+				continue; /* interior pixel: untouched (safe to read) */
+			d[(size_t)y * w + x] = d[(size_t)cy * w + cx];
+		}
+	}
+}
+
+/* Robust depth range via a histogram: returns the values at the lo/hi quantiles
+ * instead of the raw min/max. Plain min/max lets a handful of extreme pixels (the
+ * model's boundary halos, or flat UI / black regions it cannot read) seize the
+ * [0,1] mapping and flatten the real content. Quantiles ignore that small
+ * fraction, so the content keeps its depth range no matter what else is in frame
+ * -- the core of "feed it anything" robustness. O(n), two linear passes. */
+inline void robustRange(const float *d, int n, float lo_frac, float hi_frac,
+			float &lo, float &hi)
+{
+	float mn = d[0], mx = d[0];
+	for (int i = 1; i < n; ++i) {
+		if (d[i] < mn)
+			mn = d[i];
+		if (d[i] > mx)
+			mx = d[i];
+	}
+	lo = mn;
+	hi = mx;
+	if (mx <= mn || n < 16)
+		return; /* degenerate / too few samples: fall back to min/max */
+
+	constexpr int B = 1024;
+	int hist[B] = {0};
+	const float scale = (float)B / (mx - mn);
+	for (int i = 0; i < n; ++i) {
+		int b = (int)((d[i] - mn) * scale);
+		b = b < 0 ? 0 : (b >= B ? B - 1 : b);
+		hist[b]++;
+	}
+	const int tgt_lo = (int)(lo_frac * n);
+	const int tgt_hi = (int)(hi_frac * n);
+	int cum = 0, blo = 0, bhi = B - 1;
+	for (int b = 0; b < B; ++b) {
+		cum += hist[b];
+		if (cum > tgt_lo) {
+			blo = b;
+			break;
+		}
+	}
+	cum = 0;
+	for (int b = 0; b < B; ++b) {
+		cum += hist[b];
+		if (cum >= tgt_hi) {
+			bhi = b;
+			break;
+		}
+	}
+	const float binw = (mx - mn) / (float)B;
+	lo = mn + (blo + 0.5f) * binw;
+	hi = mn + (bhi + 0.5f) * binw;
+	if (hi <= lo) { /* both quantiles fell in one bin (near-flat depth) */
+		lo = mn;
+		hi = mx;
+	}
+}
+
 /* Edge-localised depth softening. A plain global blur rounds off *all* depth
  * detail and bleeds the foreground silhouette outward; here we feather only the
  * depth discontinuities, where the backward warp tears (DIBR rubber-sheet),
@@ -183,8 +264,21 @@ inline void edgeSoftenDepth(std::vector<float> &depth, int w, int h, float sigma
 	if ((int)depth.size() != n || edge_hi <= edge_lo)
 		return;
 
-	std::vector<float> wt((size_t)n);
+	/* Two feather tiers off the same depth-gradient magnitude (measured once on
+	 * the original depth). Tier 1 = moderate+ edges, feathered at `sigma` exactly
+	 * as before. Tier 2 = only the *steepest* discontinuities, feathered over a
+	 * wider radius. The backward warp's disocclusion stretch grows with disparity,
+	 * so once robust normalisation uses the full depth range, the sharpest near/far
+	 * steps (a foreground silhouette, or a composited overlay against a far wall)
+	 * tear unless their transition is spread wider. Confining the wide feather to
+	 * those steepest edges leaves normal silhouettes and flat regions untouched,
+	 * so the de-tearing costs almost no global detail. */
+	constexpr float STEEP_HI_MULT = 2.0f;    /* tier-2 ramp: edge_hi .. 2*edge_hi */
+	constexpr float STEEP_SIGMA_MULT = 2.5f; /* tier-2 feather radius vs tier-1 */
+	std::vector<float> wt((size_t)n), wt2((size_t)n);
 	const float inv_span = 1.f / (edge_hi - edge_lo);
+	const float hi2 = edge_hi * STEEP_HI_MULT;
+	const float inv_span2 = 1.f / (hi2 - edge_hi);
 	for (int y = 0; y < h; ++y)
 		for (int x = 0; x < w; ++x) {
 			const int xm = x > 0 ? x - 1 : 0;
@@ -195,12 +289,16 @@ inline void edgeSoftenDepth(std::vector<float> &depth, int w, int h, float sigma
 						 depth[(size_t)y * w + xm]);
 			const float gy = 0.5f * (depth[(size_t)yp * w + x] -
 						 depth[(size_t)ym * w + x]);
-			float t = (std::sqrt(gx * gx + gy * gy) - edge_lo) * inv_span;
+			const float g = std::sqrt(gx * gx + gy * gy);
+			float t = (g - edge_lo) * inv_span;
 			t = t < 0.f ? 0.f : (t > 1.f ? 1.f : t);
 			wt[(size_t)y * w + x] = t * t * (3.f - 2.f * t); /* smoothstep */
+			float t2 = (g - edge_hi) * inv_span2;
+			t2 = t2 < 0.f ? 0.f : (t2 > 1.f ? 1.f : t2);
+			wt2[(size_t)y * w + x] = t2 * t2 * (3.f - 2.f * t2);
 		}
 
-	/* Dilate the weight across the blurred copy's *full* footprint
+	/* Tier 1. Dilate the weight across the blurred copy's *full* footprint
 	 * (ceil(3*sigma) = gaussianBlur's own radius). A narrower band left a
 	 * residual depth step just outside it -- the warp then concentrated the
 	 * disocclusion stretch into that narrow band and the silhouette looked
@@ -217,6 +315,21 @@ inline void edgeSoftenDepth(std::vector<float> &depth, int w, int h, float sigma
 	for (int i = 0; i < n; ++i) {
 		float ww = wt[i] < 0.f ? 0.f : (wt[i] > 1.f ? 1.f : wt[i]);
 		depth[i] += ww * (blurred[i] - depth[i]);
+	}
+
+	/* Tier 2: spread only the steepest edges over a wider radius, on top of the
+	 * tier-1 result. Same dilate-then-soften scheme at the wider sigma. */
+	const float sigma2 = sigma * STEEP_SIGMA_MULT;
+	int r2 = (int)std::ceil(3.f * sigma2);
+	if (r2 < 1)
+		r2 = 1;
+	maxFilter(wt2, w, h, r2);
+	gaussianBlur(wt2, w, h, sigma2 * 0.5f);
+	std::vector<float> blurred2 = depth;
+	gaussianBlur(blurred2, w, h, sigma2);
+	for (int i = 0; i < n; ++i) {
+		float ww = wt2[i] < 0.f ? 0.f : (wt2[i] > 1.f ? 1.f : wt2[i]);
+		depth[i] += ww * (blurred2[i] - depth[i]);
 	}
 }
 
@@ -388,15 +501,19 @@ public:
 				  0.587f * rgba[(size_t)i * 4 + 1] +
 				  0.114f * rgba[(size_t)i * 4 + 2];
 
-		/* raw depth range */
-		const float *d = raw.data();
-		float mn = d[0], mx = d[0];
-		for (int i = 1; i < n; ++i) {
-			if (d[i] < mn)
-				mn = d[i];
-			if (d[i] > mx)
-				mx = d[i];
-		}
+		/* Repair the model's unreliable border ring (replicate inward) on a
+		 * reused private copy, BEFORE measuring range or warping, so the halo
+		 * corrupts neither. Depth-side only -- the displayed image is untouched,
+		 * nothing is cropped, so this is safe for arbitrary mixed input. */
+		repaired_.assign(raw.begin(), raw.end());
+		nr3d::fixBorderRing(repaired_, w, h, BORDER_MARGIN);
+		const float *d = repaired_.data();
+
+		/* robust normalisation range (quantiles, not raw min/max): keeps a few
+		 * extreme pixels -- boundary halos, flat UI / black regions the model
+		 * can't read -- from seizing the [0,1] mapping and flattening content. */
+		float mn, mx;
+		nr3d::robustRange(d, n, RANGE_PCT_LO, RANGE_PCT_HI, mn, mx);
 
 		/* scene-cut detection: mean abs luma diff vs previous frame */
 		bool cut = false;
@@ -508,6 +625,13 @@ public:
 
 private:
 	static constexpr float RANGE_EMA = 0.90f;       /* normalisation scale LPF */
+	/* robust normalisation: track the 1%/99% depth quantiles instead of raw
+	 * min/max so outlier regions (boundary halos, flat UI, black bars) can't
+	 * blow out the range. BORDER_MARGIN px of the model's edge halo are first
+	 * replicated inward (fixBorderRing) so they enter neither range nor warp. */
+	static constexpr float RANGE_PCT_LO = 0.01f;
+	static constexpr float RANGE_PCT_HI = 0.99f;
+	static constexpr int BORDER_MARGIN = 4;
 	static constexpr float CUT_THRESH = 30.0f;      /* mean abs luma diff (0..255) */
 	static constexpr float GHOST_LO = 0.25f;        /* anti-ghost depth-residual fade lo */
 	static constexpr float GHOST_INV_SPAN = 1.0f / 0.25f;
@@ -525,4 +649,5 @@ private:
 	bool have_range_ = false;
 	float mn_ema_ = 0.f, mx_ema_ = 0.f;
 	std::vector<float> prev_gray_, prev_depth_;
+	std::vector<float> repaired_; /* reused border-repaired copy of the raw depth */
 };
