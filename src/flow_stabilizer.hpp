@@ -194,9 +194,13 @@ inline void fixBorderRing(std::vector<float> &d, int w, int h, int margin)
 /* Robust depth range via a histogram: returns the values at the lo/hi quantiles
  * instead of the raw min/max. Plain min/max lets a handful of extreme pixels (the
  * model's boundary halos, or flat UI / black regions it cannot read) seize the
- * [0,1] mapping and flatten the real content. Quantiles ignore that small
- * fraction, so the content keeps its depth range no matter what else is in frame
- * -- the core of "feed it anything" robustness. O(n), two linear passes. */
+ * [0,1] mapping and flatten the real content. Quantiles ignore the outermost
+ * lo_frac / (1-hi_frac) of pixels, so thin outlier tails no longer steal the
+ * range. NOTE the limit: a region larger than that fraction sitting at a depth
+ * extreme (e.g. a wide letterbox bar, or a big UI panel the model reads as a
+ * flat near/far plane) is NOT an outlier by count and can still compress the
+ * content range -- widen the quantiles or pre-crop such inputs if needed.
+ * O(n), two linear passes; assumes finite input (callers sanitise NaN/Inf). */
 inline void robustRange(const float *d, int n, float lo_frac, float hi_frac,
 			float &lo, float &hi)
 {
@@ -276,6 +280,7 @@ inline void edgeSoftenDepth(std::vector<float> &depth, int w, int h, float sigma
 	constexpr float STEEP_HI_MULT = 2.0f;    /* tier-2 ramp: edge_hi .. 2*edge_hi */
 	constexpr float STEEP_SIGMA_MULT = 2.5f; /* tier-2 feather radius vs tier-1 */
 	std::vector<float> wt((size_t)n), wt2((size_t)n);
+	bool any1 = false, any2 = false; /* skip a tier's blurs if it has no edges */
 	const float inv_span = 1.f / (edge_hi - edge_lo);
 	const float hi2 = edge_hi * STEEP_HI_MULT;
 	const float inv_span2 = 1.f / (hi2 - edge_hi);
@@ -292,44 +297,55 @@ inline void edgeSoftenDepth(std::vector<float> &depth, int w, int h, float sigma
 			const float g = std::sqrt(gx * gx + gy * gy);
 			float t = (g - edge_lo) * inv_span;
 			t = t < 0.f ? 0.f : (t > 1.f ? 1.f : t);
+			if (t > 0.f)
+				any1 = true;
 			wt[(size_t)y * w + x] = t * t * (3.f - 2.f * t); /* smoothstep */
 			float t2 = (g - edge_hi) * inv_span2;
 			t2 = t2 < 0.f ? 0.f : (t2 > 1.f ? 1.f : t2);
+			if (t2 > 0.f)
+				any2 = true;
 			wt2[(size_t)y * w + x] = t2 * t2 * (3.f - 2.f * t2);
 		}
 
-	/* Tier 1. Dilate the weight across the blurred copy's *full* footprint
-	 * (ceil(3*sigma) = gaussianBlur's own radius). A narrower band left a
-	 * residual depth step just outside it -- the warp then concentrated the
-	 * disocclusion stretch into that narrow band and the silhouette looked
-	 * sharply distorted. Covering the whole ramp makes the edge feather as
-	 * softly as a global blur would, while flat regions stay crisp. */
-	int r = (int)std::ceil(3.f * sigma);
-	if (r < 1)
-		r = 1;
-	maxFilter(wt, w, h, r);            /* cover the feather band */
-	gaussianBlur(wt, w, h, sigma * 0.5f); /* soften the weight boundary */
+	/* Tier 1. Skipped entirely on a frame with no edges >= edge_lo (e.g. a flat
+	 * depth field), where the blend would add zero anyway -- this avoids a per-
+	 * frame max filter + Gaussian blur in that case. Dilate the weight across the
+	 * blurred copy's *full* footprint (ceil(3*sigma) = gaussianBlur's own radius):
+	 * a narrower band left a residual depth step just outside it, where the warp
+	 * then concentrated the disocclusion stretch and the silhouette looked sharply
+	 * distorted. Covering the whole ramp feathers as softly as a global blur would,
+	 * while flat regions stay crisp. */
+	if (any1) {
+		int r = (int)std::ceil(3.f * sigma);
+		if (r < 1)
+			r = 1;
+		maxFilter(wt, w, h, r);            /* cover the feather band */
+		gaussianBlur(wt, w, h, sigma * 0.5f); /* soften the weight boundary */
 
-	std::vector<float> blurred = depth;
-	gaussianBlur(blurred, w, h, sigma);
-	for (int i = 0; i < n; ++i) {
-		float ww = wt[i] < 0.f ? 0.f : (wt[i] > 1.f ? 1.f : wt[i]);
-		depth[i] += ww * (blurred[i] - depth[i]);
+		std::vector<float> blurred = depth;
+		gaussianBlur(blurred, w, h, sigma);
+		for (int i = 0; i < n; ++i) {
+			float ww = wt[i] < 0.f ? 0.f : (wt[i] > 1.f ? 1.f : wt[i]);
+			depth[i] += ww * (blurred[i] - depth[i]);
+		}
 	}
 
 	/* Tier 2: spread only the steepest edges over a wider radius, on top of the
-	 * tier-1 result. Same dilate-then-soften scheme at the wider sigma. */
-	const float sigma2 = sigma * STEEP_SIGMA_MULT;
-	int r2 = (int)std::ceil(3.f * sigma2);
-	if (r2 < 1)
-		r2 = 1;
-	maxFilter(wt2, w, h, r2);
-	gaussianBlur(wt2, w, h, sigma2 * 0.5f);
-	std::vector<float> blurred2 = depth;
-	gaussianBlur(blurred2, w, h, sigma2);
-	for (int i = 0; i < n; ++i) {
-		float ww = wt2[i] < 0.f ? 0.f : (wt2[i] > 1.f ? 1.f : wt2[i]);
-		depth[i] += ww * (blurred2[i] - depth[i]);
+	 * tier-1 result. Same dilate-then-soften scheme at the wider sigma. Skipped
+	 * (no extra blurs) when no edge exceeds edge_hi -- the common case. */
+	if (any2) {
+		const float sigma2 = sigma * STEEP_SIGMA_MULT;
+		int r2 = (int)std::ceil(3.f * sigma2);
+		if (r2 < 1)
+			r2 = 1;
+		maxFilter(wt2, w, h, r2);
+		gaussianBlur(wt2, w, h, sigma2 * 0.5f);
+		std::vector<float> blurred2 = depth;
+		gaussianBlur(blurred2, w, h, sigma2);
+		for (int i = 0; i < n; ++i) {
+			float ww = wt2[i] < 0.f ? 0.f : (wt2[i] > 1.f ? 1.f : wt2[i]);
+			depth[i] += ww * (blurred2[i] - depth[i]);
+		}
 	}
 }
 
@@ -507,6 +523,15 @@ public:
 		 * nothing is cropped, so this is safe for arbitrary mixed input. */
 		repaired_.assign(raw.begin(), raw.end());
 		nr3d::fixBorderRing(repaired_, w, h, BORDER_MARGIN);
+		/* Sanitise non-finite model outputs (NaN/Inf) once, here at the boundary,
+		 * so every consumer below is guaranteed finite: robustRange() converts
+		 * depth to a histogram bin via float->int (undefined for non-finite), and
+		 * a NaN would otherwise slip through the [0,1] clamp into cur/warp. ONNX
+		 * Run() validates only dtype/count, not finiteness, so a degenerate frame
+		 * could carry one. 0 is a neutral stand-in (clamps to far after normalise). */
+		for (float &v : repaired_)
+			if (!std::isfinite(v))
+				v = 0.f;
 		const float *d = repaired_.data();
 
 		/* robust normalisation range (quantiles, not raw min/max): keeps a few
@@ -626,9 +651,12 @@ public:
 private:
 	static constexpr float RANGE_EMA = 0.90f;       /* normalisation scale LPF */
 	/* robust normalisation: track the 1%/99% depth quantiles instead of raw
-	 * min/max so outlier regions (boundary halos, flat UI, black bars) can't
-	 * blow out the range. BORDER_MARGIN px of the model's edge halo are first
-	 * replicated inward (fixBorderRing) so they enter neither range nor warp. */
+	 * min/max so thin outlier tails (boundary halos, small flat/black patches)
+	 * can't blow out the range. BORDER_MARGIN px of the model's edge halo are
+	 * first replicated inward (fixBorderRing) so they enter neither range nor
+	 * warp. Caveat: regions wider than ~1% of the frame at a depth extreme (a
+	 * large letterbox bar / UI panel) exceed the quantile margin and can still
+	 * skew the range -- widen these or pre-crop for such inputs. */
 	static constexpr float RANGE_PCT_LO = 0.01f;
 	static constexpr float RANGE_PCT_HI = 0.99f;
 	static constexpr int BORDER_MARGIN = 4;
