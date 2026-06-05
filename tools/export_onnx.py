@@ -14,8 +14,8 @@ DA V2 (DINOv2 ViT, patch 14) accepts any width/height that are multiples of 14,
 so a non-square (e.g. 16:9) input can be exported to match the source aspect.
 
   python tools/export_onnx.py                            # 448x252 (16:9), FP16 (currently shipped)
-  python tools/export_onnx.py --width 224 --height 126 \
-      --out models/dav2_224x126.onnx                     # lightweight (-lite) model
+  python tools/export_onnx.py --width 392 --height 224 \
+      --out models/dav2_392x224.onnx                     # lightweight (-lite) model
   python tools/export_onnx.py --width 392 --height 392   # legacy square, FP16
   python tools/export_onnx.py --no-fp16                  # FP32 graph
 
@@ -23,7 +23,8 @@ Requires: torch, transformers, onnx, onnxruntime (+ CUDA for FP16).
 Note: the plugin reads its inference dims straight from the model's fixed input
 shape (OrtDepth::Init), so any multiple-of-14 W x H export is a drop-in -- no code
 change is needed. Bundle the chosen .onnx as data/depth_anything_v2_small.onnx
-(package.ps1 does this per variant); 448x252 is the default, 224x126 the -lite one.
+(package.ps1 does this per variant); 448x252 is the default, 392x224 the -lite one
+(224x126 is too few tokens -- DA-V2 loses subject structure below ~336).
 """
 from __future__ import annotations
 

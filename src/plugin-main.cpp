@@ -35,7 +35,7 @@
  * CMake (-DPLUGIN_VERSION, e.g. v0.3.1 for a tag build); the fallback below is
  * only used for IDE/standalone builds that don't define it. */
 #ifndef REAL3D_VERSION
-#define REAL3D_VERSION "0.4.0-dev"
+#define REAL3D_VERSION "0.4.1-dev"
 #endif
 #define REAL3D_BUILD_INFO \
 	("near Real 3D " REAL3D_VERSION "  (built " __DATE__ " " __TIME__ ")")
@@ -53,10 +53,10 @@ static const float STRENGTH_FRAC[5] = {0.0f, 0.010f, 0.018f, 0.028f, 0.045f};
 /* Default depth inference input dims (W x H) -- the fallback used when no ONNX
  * model loads (luminance-depth path). When a model loads, the *actual* dims are
  * read from its fixed input shape (OrtDepth::Init) into the per-filter
- * infer_w/infer_h, so shipping a lighter export (e.g. 224x126, a quarter of the
- * tokens for ~2-3x the speed on a weak iGPU) drives the whole pipeline with no
- * code change. 448x252 is 16:9 (both multiples of 14) to match the source/per-eye
- * aspect; the inference path is fully dimension-general. */
+ * infer_w/infer_h, so shipping a lighter export (e.g. 392x224 -lite, ~1.4x the
+ * speed on a weak iGPU at near-full depth quality) drives the whole pipeline with
+ * no code change. 448x252 is 16:9 (both multiples of 14) to match the source/per-
+ * eye aspect; the inference path is fully dimension-general. */
 static const int DEFAULT_INFER_W = 448;
 static const int DEFAULT_INFER_H = 252;
 /* After motion stops, keep inferring this many "settle" frames so the temporal
@@ -735,7 +735,7 @@ static obs_properties_t *real3d_properties(void *data)
 	/* Built dynamically (vs the static REAL3D_BUILD_INFO macro) so the active
 	 * inference size is shown right after the version: the dims come from the
 	 * loaded model (per-filter f->infer_w/h), letting the user tell the full vs
-	 * lite (224x126) build apart in the UI, not just the log. */
+	 * lite (392x224) build apart in the UI, not just the log. */
 	std::string bi = std::string("near Real 3D ") + REAL3D_VERSION;
 	if (f && f->ort_ok)
 		bi += "  [model " + std::to_string(f->infer_w) + "x" +

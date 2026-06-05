@@ -108,14 +108,14 @@ jobs:
           } else {
             Write-Warning "MODEL_SHA256 not set - skipping model integrity check (non-tag build)"
           }
-          # Lightweight (224x126) model for the -lite variant. Optional: when
+          # Lightweight (392x224) model for the -lite variant. Optional: when
           # MODEL_LITE_URL is unset the lite package is simply skipped, so the full
           # release still builds. When set on a tag it must also be verified.
           if ($env:MODEL_LITE_URL) {
             if (($env:IS_TAG -eq 'true') -and (-not $env:MODEL_LITE_SHA256)) {
               throw "Tag releases with MODEL_LITE_URL require MODEL_LITE_SHA256 to verify the lite model."
             }
-            $lite = "models/dav2_224x126.onnx"
+            $lite = "models/dav2_392x224.onnx"
             Invoke-WebRequest -Uri $env:MODEL_LITE_URL -OutFile $lite
             if ($env:MODEL_LITE_SHA256) {
               $got = (Get-FileHash $lite -Algorithm SHA256).Hash.ToLower()
@@ -145,10 +145,10 @@ jobs:
         run: |
           ./package.ps1 -Version $env:PLUGIN_VERSION -Variant full
           # Lite variant only when its model was fetched above (MODEL_LITE_URL set).
-          if (Test-Path "models/dav2_224x126.onnx") {
+          if (Test-Path "models/dav2_392x224.onnx") {
             ./package.ps1 -Version $env:PLUGIN_VERSION -Variant lite
           } else {
-            Write-Warning "models/dav2_224x126.onnx absent -> skipping lite package"
+            Write-Warning "models/dav2_392x224.onnx absent -> skipping lite package"
           }
 
       - name: Upload artifacts (every run)

@@ -2,16 +2,16 @@
 ; Built by package.ps1 / CI. The staged plugin tree must exist at
 ;   ..\dist\stage\obs-near-real3d\{bin\64bit, data, ...}
 ; Pass the version with:  ISCC.exe /DAppVersion=0.3.1 obs-near-real3d.iss
-; Pass /DLite for the lightweight (224x126 model) build. Both variants share the
+; Pass /DLite for the lightweight (392x224 model) build. Both variants share the
 ; same AppId and install path, so installing one replaces the other (the DLL and
 ; install dir are identical -- only the bundled model differs).
 
 #ifndef AppVersion
-  #define AppVersion "0.4.0-dev"
+  #define AppVersion "0.4.1-dev"
 #endif
 #ifdef Lite
   #define VariantSuffix "-lite"
-  #define VariantLabel " Lite (224x126)"
+  #define VariantLabel " Lite (392x224)"
 #else
   #define VariantSuffix ""
   #define VariantLabel ""
