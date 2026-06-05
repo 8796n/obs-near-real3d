@@ -99,7 +99,7 @@ public:
 			}
 			if (ti.GetElementCount() != (size_t)n) {
 				last_error_ = "unexpected depth element count "
-					      "(model size != INFER_W*INFER_H?)";
+					      "(model output size != input WxH?)";
 				return false;
 			}
 			/* raw inverse depth; normalisation + temporal stabilisation +
