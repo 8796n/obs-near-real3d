@@ -23,7 +23,7 @@
 
 class OrtDepth {
 public:
-	bool Init(const std::wstring &model_path, int w, int h)
+	bool Init(const std::wstring &model_path)
 	{
 		try {
 			Ort::SessionOptions so;
@@ -33,10 +33,23 @@ public:
 			Ort::ThrowOnError(
 				OrtSessionOptionsAppendExecutionProvider_DML(so, 0));
 			session_ = Ort::Session(env_, model_path.c_str(), so);
-			w_ = w;
-			h_ = h;
-			in_.resize((size_t)3 * w * h);
-			in_shape_ = {1, 3, h, w}; /* NCHW */
+			/* The exported model has a fixed input shape [1,3,H,W] (no dynamic
+			 * axes -- DirectML is far slower with them), so read the inference
+			 * dims straight from the model. A different export (e.g. a lighter
+			 * 224x126 model) then drives the whole pipeline with no code change:
+			 * the caller sizes its textures/buffers from width()/height(). */
+			std::vector<int64_t> shape =
+				session_.GetInputTypeInfo(0)
+					.GetTensorTypeAndShapeInfo()
+					.GetShape();
+			if (shape.size() != 4 || shape[2] <= 0 || shape[3] <= 0) {
+				last_error_ = "model input is not a fixed [1,3,H,W] shape";
+				return false;
+			}
+			h_ = (int)shape[2];
+			w_ = (int)shape[3];
+			in_.resize((size_t)3 * w_ * h_);
+			in_shape_ = {1, 3, h_, w_}; /* NCHW */
 			return true;
 		} catch (const std::exception &e) {
 			last_error_ = e.what();
@@ -86,7 +99,7 @@ public:
 			}
 			if (ti.GetElementCount() != (size_t)n) {
 				last_error_ = "unexpected depth element count "
-					      "(model size != INFER_W*INFER_H?)";
+					      "(model output size != input WxH?)";
 				return false;
 			}
 			/* raw inverse depth; normalisation + temporal stabilisation +

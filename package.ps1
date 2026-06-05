@@ -1,20 +1,43 @@
 # Stage the built plugin + runtimes + model into the OBS plugin layout, then
 # produce a portable ZIP and (if Inno Setup is present) an installer .exe.
 #
+# The DLL is identical for both variants: the plugin reads its inference dims from
+# the bundled model's input shape, so a variant only swaps which .onnx ships as
+# data\depth_anything_v2_small.onnx.
+#   -Variant full  (default): 448x252 model  (models\depth_anything_v2_small.onnx)
+#   -Variant lite           : 224x126 model  (models\dav2_224x126.onnx) -- a quarter
+#                             of the tokens, ~2-3x faster on weak iGPUs. Export it
+#                             with: python tools\export_onnx.py --width 224 --height 126 `
+#                                     --out models\dav2_224x126.onnx
+#
 # Run build.ps1 first (so build\obs-near-real3d.dll exists). Works locally and
-# in CI. Usage:  .\package.ps1 -Version 0.3.1
-param([string]$Version = "0.3.1-dev")
+# in CI. Usage:  .\package.ps1 -Version 0.3.1            # full
+#                .\package.ps1 -Version 0.3.1 -Variant lite
+param(
+  [string]$Version = "0.4.0-dev",
+  [ValidateSet("full", "lite")][string]$Variant = "full"
+)
 $ErrorActionPreference = "Stop"
 $SRC   = $PSScriptRoot
 $DIST  = Join-Path $SRC "dist"
 $ROOT  = Join-Path $DIST "stage\obs-near-real3d"   # zip/installer root folder
 $bin   = Join-Path $ROOT "bin\64bit"
 $data  = Join-Path $ROOT "data"
+# Per-variant model source + artifact name suffix. The runtime always loads the
+# same filename, so the chosen model is copied in under that fixed name.
+$suffix = if ($Variant -eq "lite") { "-lite" } else { "" }
+$modelSrc = if ($Variant -eq "lite") {
+  Join-Path $SRC "models\dav2_224x126.onnx"
+} else {
+  Join-Path $SRC "models\depth_anything_v2_small.onnx"
+}
 
 $dll = Join-Path $SRC "build\obs-near-real3d.dll"
 if (-not (Test-Path $dll)) { throw "build first (build\obs-near-real3d.dll missing)" }
 
-Remove-Item $DIST -Recurse -Force -ErrorAction SilentlyContinue
+# Clean only the staging tree, not the whole dist: building both variants
+# (full then lite) in sequence must not wipe the first variant's zip/installer.
+Remove-Item (Join-Path $DIST "stage") -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $bin, $data | Out-Null
 
 # plugin + runtime DLLs (loader finds them next to the plugin)
@@ -25,11 +48,16 @@ foreach ($d in @("onnxruntime.dll", "DirectML.dll")) {
   Copy-Item $p $bin -Force
 }
 
-# effect + locale (everything under data\) + the depth model
+# effect + locale (everything under data\) + the depth model. The model is copied
+# under the fixed runtime name regardless of variant (the plugin loads it by name
+# and reads its dims from the model itself).
 Copy-Item (Join-Path $SRC "data\*") $data -Recurse -Force
-$mdl = Join-Path $SRC "models\depth_anything_v2_small.onnx"
-if (-not (Test-Path $mdl)) { throw "model missing: $mdl" }
-Copy-Item $mdl $data -Force
+if (-not (Test-Path $modelSrc)) {
+  throw "model missing: $modelSrc (variant '$Variant'). For 'lite', export it first: " +
+        "python tools\export_onnx.py --width 224 --height 126 --out models\dav2_224x126.onnx"
+}
+Copy-Item $modelSrc (Join-Path $data "depth_anything_v2_small.onnx") -Force
+Write-Host "[model] $Variant -> $(Split-Path $modelSrc -Leaf)" -ForegroundColor Cyan
 
 # docs / licenses alongside the plugin
 foreach ($f in @("LICENSE", "THIRD_PARTY_LICENSES", "README.md")) {
@@ -47,7 +75,7 @@ foreach ($l in $reqLic) {
 Copy-Item $licSrc $ROOT -Recurse -Force
 
 # ----- ZIP (root contains obs-near-real3d\...) -----
-$zip = Join-Path $DIST "near-real3d-$Version-windows-x64.zip"
+$zip = Join-Path $DIST "near-real3d-$Version$suffix-windows-x64.zip"
 Compress-Archive -Path $ROOT -DestinationPath $zip -Force
 Write-Host "zip      -> $zip" -ForegroundColor Green
 
@@ -57,9 +85,12 @@ $iscc = @(
   "C:\Program Files\Inno Setup 6\ISCC.exe"
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 if ($iscc) {
-  & $iscc "/DAppVersion=$Version" (Join-Path $SRC "installer\obs-near-real3d.iss")
+  # Lite variant: define `Lite` so the .iss adds the -lite suffix/label (full = no define).
+  $isccArgs = @("/DAppVersion=$Version")
+  if ($Variant -eq "lite") { $isccArgs += "/DLite" }
+  & $iscc @isccArgs (Join-Path $SRC "installer\obs-near-real3d.iss")
   if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
-  Write-Host "installer-> $(Get-ChildItem $DIST -Filter *installer.exe | Select-Object -Expand FullName)" -ForegroundColor Green
+  Write-Host "installer-> $(Get-ChildItem $DIST -Filter "*$suffix-installer.exe" | Select-Object -Expand FullName)" -ForegroundColor Green
 } else {
   Write-Warning "Inno Setup (ISCC.exe) not found - skipped installer (ZIP still built). Install Inno Setup 6 to build the .exe."
 }
