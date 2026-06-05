@@ -5,16 +5,19 @@
 # the bundled model's input shape, so a variant only swaps which .onnx ships as
 # data\depth_anything_v2_small.onnx.
 #   -Variant full  (default): 448x252 model  (models\depth_anything_v2_small.onnx)
-#   -Variant lite           : 224x126 model  (models\dav2_224x126.onnx) -- a quarter
-#                             of the tokens, ~2-3x faster on weak iGPUs. Export it
-#                             with: python tools\export_onnx.py --width 224 --height 126 `
-#                                     --out models\dav2_224x126.onnx
+#   -Variant lite           : 392x224 model  (models\dav2_392x224.onnx) -- ~1.4x
+#                             faster on weak iGPUs at near-full depth quality. (224x126
+#                             was tried but DA-V2 loses subject structure below ~336
+#                             tokens; 392x224=448 tokens is the usable lower bound.)
+#                             Export it with:
+#                               python tools\export_onnx.py --width 392 --height 224 `
+#                                 --out models\dav2_392x224.onnx
 #
 # Run build.ps1 first (so build\obs-near-real3d.dll exists). Works locally and
 # in CI. Usage:  .\package.ps1 -Version 0.3.1            # full
 #                .\package.ps1 -Version 0.3.1 -Variant lite
 param(
-  [string]$Version = "0.4.0-dev",
+  [string]$Version = "0.4.1-dev",
   [ValidateSet("full", "lite")][string]$Variant = "full"
 )
 $ErrorActionPreference = "Stop"
@@ -27,7 +30,7 @@ $data  = Join-Path $ROOT "data"
 # same filename, so the chosen model is copied in under that fixed name.
 $suffix = if ($Variant -eq "lite") { "-lite" } else { "" }
 $modelSrc = if ($Variant -eq "lite") {
-  Join-Path $SRC "models\dav2_224x126.onnx"
+  Join-Path $SRC "models\dav2_392x224.onnx"
 } else {
   Join-Path $SRC "models\depth_anything_v2_small.onnx"
 }
@@ -54,7 +57,7 @@ foreach ($d in @("onnxruntime.dll", "DirectML.dll")) {
 Copy-Item (Join-Path $SRC "data\*") $data -Recurse -Force
 if (-not (Test-Path $modelSrc)) {
   throw "model missing: $modelSrc (variant '$Variant'). For 'lite', export it first: " +
-        "python tools\export_onnx.py --width 224 --height 126 --out models\dav2_224x126.onnx"
+        "python tools\export_onnx.py --width 392 --height 224 --out models\dav2_392x224.onnx"
 }
 Copy-Item $modelSrc (Join-Path $data "depth_anything_v2_small.onnx") -Force
 Write-Host "[model] $Variant -> $(Split-Path $modelSrc -Leaf)" -ForegroundColor Cyan

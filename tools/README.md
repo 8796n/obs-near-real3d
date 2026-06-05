@@ -9,14 +9,14 @@ Depth Anything V2 Small を ONNX 化して `models/depth_anything_v2_small.onnx`
 
 ```bash
 python tools/export_onnx.py                          # 448x252 (16:9), FP16 (現行同梱)
-python tools/export_onnx.py --width 224 --height 126 \
-    --out models/dav2_224x126.onnx                   # 軽量版 (-lite) モデル
+python tools/export_onnx.py --width 392 --height 224 \
+    --out models/dav2_392x224.onnx                   # 軽量版 (-lite) モデル
 python tools/export_onnx.py --width 392 --height 392 # legacy 正方
 python tools/export_onnx.py --no-fp16                # FP32 グラフ
 ```
 
 要 `torch` / `transformers` / `onnx` / `onnxruntime`（FP16 は CUDA）。入力は 14 の倍数なら任意の W×H 可。
-**プラグインは同梱モデルの入力形状から推論寸を読む**（`OrtDepth::Init`）ので、別寸でもコード変更は不要 —— 再エクスポートして差し替えるだけ。軽量版は `package.ps1 -Variant lite` が `models/dav2_224x126.onnx` を同梱する。
+**プラグインは同梱モデルの入力形状から推論寸を読む**（`OrtDepth::Init`）ので、別寸でもコード変更は不要 —— 再エクスポートして差し替えるだけ。軽量版は `package.ps1 -Variant lite` が `models/dav2_392x224.onnx` を同梱する（224×126 は DA‑V2 がトークン不足で深度が崩れるため不可。実用下限は ~336、採用は 392×224）。
 
 ## `avsync_test.html` — A/V 同期テストパターン
 
