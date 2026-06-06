@@ -35,7 +35,7 @@
  * CMake (-DPLUGIN_VERSION, e.g. v0.3.1 for a tag build); the fallback below is
  * only used for IDE/standalone builds that don't define it. */
 #ifndef REAL3D_VERSION
-#define REAL3D_VERSION "0.5.0-dev"
+#define REAL3D_VERSION "0.0.0-nocmake" /* sentinel: CMake always passes the real one */
 #endif
 #define REAL3D_BUILD_INFO \
 	("near Real 3D " REAL3D_VERSION "  (built " __DATE__ " " __TIME__ ")")

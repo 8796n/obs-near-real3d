@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
-project(obs-near-real3d VERSION 0.5.0 LANGUAGES C CXX)
+# Single source of truth for the version. Local/IDE builds bake "<VERSION>-dev"
+# (see PLUGIN_VERSION below); package.ps1 parses this same line for the ZIP /
+# installer name. Releases override everything from the git tag (-DPLUGIN_VERSION).
+project(obs-near-real3d VERSION 0.5.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
