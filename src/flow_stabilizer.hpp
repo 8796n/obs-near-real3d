@@ -141,6 +141,32 @@ inline void gaussianBlur(std::vector<float> &im, int w, int h, float sigma)
 		}
 }
 
+/* Fast almost-Gaussian blur: three normalised box passes (each O(n) via boxSum's
+ * running sum) approximate a Gaussian of the given sigma (central limit theorem),
+ * at a cost independent of the radius -- unlike gaussianBlur's O(n*r). Used for
+ * the depth-edge feathering: the result is a low-frequency feather, so the box vs
+ * Gaussian tail shape is visually indistinguishable while the wide tier-2 blur
+ * (large radius) gets dramatically cheaper. Replicate borders (via boxSum). */
+inline void boxBlur3(std::vector<float> &im, int w, int h, float sigma)
+{
+	if (sigma <= 0.f)
+		return;
+	/* Radius so three box passes match the Gaussian variance sigma^2: a 1-D box of
+	 * radius r has variance (r^2+r)/3, and three of them sum to r^2+r. Solve
+	 * r^2+r = sigma^2 and round; the match is near-exact for the wide blurs that
+	 * dominate the cost. */
+	int r = (int)std::lround(
+		(-1.0 + std::sqrt(1.0 + 4.0 * (double)sigma * sigma)) / 2.0);
+	if (r < 1)
+		r = 1;
+	const float norm = 1.f / (float)((2 * r + 1) * (2 * r + 1));
+	for (int pass = 0; pass < 3; ++pass) {
+		boxSum(im, w, h, r);
+		for (float &v : im)
+			v *= norm;
+	}
+}
+
 /* separable max filter over a (2r+1)^2 window, replicate borders */
 inline void maxFilter(std::vector<float> &im, int w, int h, int r)
 {
@@ -321,10 +347,10 @@ inline void edgeSoftenDepth(std::vector<float> &depth, int w, int h, float sigma
 		if (r < 1)
 			r = 1;
 		maxFilter(wt, w, h, r);            /* cover the feather band */
-		gaussianBlur(wt, w, h, sigma * 0.5f); /* soften the weight boundary */
+		boxBlur3(wt, w, h, sigma * 0.5f); /* soften the weight boundary */
 
 		std::vector<float> blurred = depth;
-		gaussianBlur(blurred, w, h, sigma);
+		boxBlur3(blurred, w, h, sigma);
 		for (int i = 0; i < n; ++i) {
 			float ww = wt[i] < 0.f ? 0.f : (wt[i] > 1.f ? 1.f : wt[i]);
 			depth[i] += ww * (blurred[i] - depth[i]);
@@ -340,9 +366,9 @@ inline void edgeSoftenDepth(std::vector<float> &depth, int w, int h, float sigma
 		if (r2 < 1)
 			r2 = 1;
 		maxFilter(wt2, w, h, r2);
-		gaussianBlur(wt2, w, h, sigma2 * 0.5f);
+		boxBlur3(wt2, w, h, sigma2 * 0.5f);
 		std::vector<float> blurred2 = depth;
-		gaussianBlur(blurred2, w, h, sigma2);
+		boxBlur3(blurred2, w, h, sigma2);
 		for (int i = 0; i < n; ++i) {
 			float ww = wt2[i] < 0.f ? 0.f : (wt2[i] > 1.f ? 1.f : wt2[i]);
 			depth[i] += ww * (blurred2[i] - depth[i]);
