@@ -6,8 +6,11 @@
 ; same AppId and install path, so installing one replaces the other (the DLL and
 ; install dir are identical -- only the bundled model differs).
 
+; package.ps1 always passes /DAppVersion (from the git tag in CI, or CMakeLists'
+; project() VERSION for a local build), so this fallback is a sentinel, not a
+; version to keep in sync -- it only shows if ISCC is run directly on this .iss.
 #ifndef AppVersion
-  #define AppVersion "0.5.0-dev"
+  #define AppVersion "0.0.0-noversion"
 #endif
 #ifdef Lite
   #define VariantSuffix "-lite"

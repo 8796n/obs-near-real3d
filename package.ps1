@@ -17,11 +17,22 @@
 # in CI. Usage:  .\package.ps1 -Version 0.3.1            # full
 #                .\package.ps1 -Version 0.3.1 -Variant lite
 param(
-  [string]$Version = "0.5.0-dev",
+  [string]$Version,
   [ValidateSet("full", "lite")][string]$Variant = "full"
 )
 $ErrorActionPreference = "Stop"
 $SRC   = $PSScriptRoot
+# Version single source of truth: CMakeLists' project(... VERSION x.y.z ...). CI
+# passes -Version explicitly (from the git tag); a bare local run derives
+# "<x.y.z>-dev" from CMakeLists so the version lives in exactly one place.
+if (-not $Version) {
+  $cml = Get-Content (Join-Path $SRC 'CMakeLists.txt') -Raw
+  if ($cml -match 'project\s*\([^)]*VERSION\s+(\d+\.\d+\.\d+)') {
+    $Version = "$($Matches[1])-dev"
+  } else {
+    throw "could not parse VERSION from CMakeLists.txt"
+  }
+}
 $DIST  = Join-Path $SRC "dist"
 $ROOT  = Join-Path $DIST "stage\obs-near-real3d"   # zip/installer root folder
 $bin   = Join-Path $ROOT "bin\64bit"
