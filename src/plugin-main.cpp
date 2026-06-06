@@ -224,7 +224,9 @@ struct real3d_filter {
 	std::vector<float> depth_buf;  /* infer_w*infer_h */
 	bool input_ready = false, depth_ready = false, stop = false;
 	uint32_t in_gen = 0;           /* (m) scene-cut generation of in_buf's frame */
+	bool in_forced = false;        /* (m) off-cadence cut-forced submission */
 	uint32_t out_gen = 0;          /* (m) generation depth_buf was computed for */
+	bool out_forced = false;       /* (m) depth_buf came from a cut-forced submission */
 	float out_conf = 1.0f;         /* (m) scene confidence for depth_buf (auto 3D-suppress) */
 	uint64_t in_ts = 0;            /* (m) capture timestamp of in_buf's frame (ns) */
 	uint64_t out_ts = 0;           /* (m) capture timestamp depth_buf was computed for */
@@ -498,6 +500,7 @@ static void worker_fn(real3d_filter *f)
 		uint32_t gen = 0;
 		uint64_t ts = 0;
 		uint64_t submit = 0;
+		bool forced = false;
 		{
 			std::unique_lock<std::mutex> lk(f->m);
 			f->cv.wait(lk, [&] { return f->input_ready || f->stop; });
@@ -507,6 +510,7 @@ static void worker_fn(real3d_filter *f)
 			gen = f->in_gen; /* which cut generation this frame belongs to */
 			ts = f->in_ts;   /* capture timestamp, for the delay-mode latency measure */
 			submit = f->in_submit_ns; /* when it was queued, for the wait measure */
+			forced = f->in_forced; /* cut-forced -> excluded from the latency EMA */
 			f->input_ready = false;
 		}
 		const bool temporal = f->ort.temporal.load(std::memory_order_relaxed);
@@ -528,6 +532,7 @@ static void worker_fn(real3d_filter *f)
 				f->depth_buf.swap(stab);
 				f->out_gen = gen; /* tag the result with its cut generation */
 				f->out_conf = f->flow.confidence(); /* for auto 3D-suppress */
+				f->out_forced = forced; /* propagate the cut-forced tag */
 				f->out_ts = ts;   /* ...and the frame's capture timestamp */
 				/* latency decomposition (debug): how long it sat queued before
 				 * the worker picked it up, and how long the compute itself took. */
@@ -1152,6 +1157,7 @@ static void maybe_submit_inference(real3d_filter *f, gs_texture_t *full)
 			f->in_gen = f->scene_gen;
 			f->in_ts = readback_ts;
 			f->in_submit_ns = now;
+			f->in_forced = true; /* cut-forced: keep its latency out of the EMA */
 			f->input_ready = true;
 		}
 		f->cv.notify_one();
@@ -1202,6 +1208,7 @@ static void maybe_submit_inference(real3d_filter *f, gs_texture_t *full)
 		f->in_gen = f->scene_gen;
 		f->in_ts = readback_ts;
 		f->in_submit_ns = now;
+		f->in_forced = false; /* steady cadence sample: feeds the latency EMA */
 		f->input_ready = true;
 	}
 	f->cv.notify_one();
@@ -1272,6 +1279,7 @@ static void real3d_video_render(void *data, gs_effect_t *)
 		uint32_t got_gen = 0;
 		uint64_t got_ts = 0;
 		uint64_t got_wait = 0, got_compute = 0;
+		bool got_forced = false;
 		{
 			std::lock_guard<std::mutex> lk(f->m);
 			if (f->depth_ready) {
@@ -1281,6 +1289,7 @@ static void real3d_video_render(void *data, gs_effect_t *)
 				got_wait = f->out_wait_ns;
 				got_compute = f->out_compute_ns;
 				f->scene_conf = f->out_conf; /* latest auto-suppress target */
+				got_forced = f->out_forced; /* cut-forced -> skip the latency EMA */
 				f->depth_ready = false;
 			}
 		}
@@ -1319,9 +1328,13 @@ static void real3d_video_render(void *data, gs_effect_t *)
 			 * Only measure while sync delay is ON: the EMA is unused otherwise,
 			 * and measuring with it off lets a hide/resume from any duration
 			 * (which the tick reset and render-gap can't always cover when we
-			 * don't own sync) poison the value for a later enable. */
-			if (f->sync_delay.load(std::memory_order_relaxed) && got_ts &&
-			    got_ts >= f->latency_epoch_ns && now > got_ts) {
+			 * don't own sync) poison the value for a later enable. Cut-forced
+			 * (off-cadence) depths are also excluded (!got_forced): their
+			 * capture->depth timing isn't representative of the steady cadence,
+			 * so feeding them in made commit_delay -- and thus the audio sync
+			 * offset -- hunt by a frame on every scene change (audible re-time). */
+			if (f->sync_delay.load(std::memory_order_relaxed) && !got_forced &&
+			    got_ts && got_ts >= f->latency_epoch_ns && now > got_ts) {
 				const double lat = (double)(now - got_ts);
 				if (!f->delay_ema_init) {
 					f->delay_ema_ns = lat;
