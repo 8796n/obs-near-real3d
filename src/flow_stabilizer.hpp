@@ -167,30 +167,47 @@ inline void boxBlur3(std::vector<float> &im, int w, int h, float sigma)
 	}
 }
 
-/* separable max filter over a (2r+1)^2 window, replicate borders */
+/* 1-D max filter along a strided line of `len` samples at src[k*stride], radius r,
+ * replicate borders, written to dst[k*stride]. O(len) via a monotonic deque whose
+ * front is the current window maximum. With replicate borders the window max equals
+ * the max over the clamped index range [max(0,x-r), min(len-1,x+r)] (the replicated
+ * edge value never exceeds the edge sample already inside that range), so this is a
+ * BIT-EXACT replacement for the O(len*r) scan. `dq` is reused scratch of >= len. */
+inline void maxLine(const float *src, float *dst, int len, int stride, int r,
+		    std::vector<int> &dq)
+{
+	int head = 0, tail = 0; /* dq[head,tail) = candidate indices, values decreasing */
+	int added = -1;
+	for (int x = 0; x < len; ++x) {
+		const int rt = x + r < len ? x + r : len - 1;
+		while (added < rt) { /* push new indices entering the window's right edge */
+			++added;
+			const float v = src[(size_t)added * stride];
+			while (tail > head &&
+			       src[(size_t)dq[tail - 1] * stride] <= v)
+				--tail;
+			dq[tail++] = added;
+		}
+		const int lf = x - r > 0 ? x - r : 0;
+		while (head < tail && dq[head] < lf) /* pop indices left of the window */
+			++head;
+		dst[(size_t)x * stride] = src[(size_t)dq[head] * stride];
+	}
+}
+
+/* separable max filter over a (2r+1)^2 window, replicate borders. O(n) via the
+ * sliding-window maximum above, independent of the radius -- the wide tier-2 dilate
+ * (r ~ 14) no longer costs O(n*r). Bit-exact with the old per-pixel scan. */
 inline void maxFilter(std::vector<float> &im, int w, int h, int r)
 {
 	if (r < 1)
 		return;
-	auto cl = [](int i, int n) { return i < 0 ? 0 : (i >= n ? n - 1 : i); };
 	std::vector<float> tmp((size_t)w * h);
-	for (int y = 0; y < h; ++y) {
-		const float *row = &im[(size_t)y * w];
-		float *out = &tmp[(size_t)y * w];
-		for (int x = 0; x < w; ++x) {
-			float m = row[x];
-			for (int k = -r; k <= r; ++k)
-				m = std::max(m, row[cl(x + k, w)]);
-			out[x] = m;
-		}
-	}
-	for (int x = 0; x < w; ++x)
-		for (int y = 0; y < h; ++y) {
-			float m = tmp[(size_t)y * w + x];
-			for (int k = -r; k <= r; ++k)
-				m = std::max(m, tmp[(size_t)cl(y + k, h) * w + x]);
-			im[(size_t)y * w + x] = m;
-		}
+	std::vector<int> dq((size_t)(w > h ? w : h)); /* reused deque index buffer */
+	for (int y = 0; y < h; ++y) /* horizontal: im row -> tmp row */
+		maxLine(&im[(size_t)y * w], &tmp[(size_t)y * w], w, 1, r, dq);
+	for (int x = 0; x < w; ++x) /* vertical: tmp column -> im column */
+		maxLine(&tmp[(size_t)x], &im[(size_t)x], h, w, r, dq);
 }
 
 /* Replace the outermost `margin` px ring of the depth with the nearest interior
@@ -612,7 +629,32 @@ public:
 		} else {
 			std::vector<float> u, vv;
 			const auto _tflow = std::chrono::steady_clock::now();
-			nr3d::denseFlowLK(prev_gray_, gray, w, h, u, vv);
+			/* Half-resolution dense flow: the depth is low-frequency and the
+			 * residual fallback masks flow errors, so computing the optical flow
+			 * at half size (a quarter of the pixels) and upscaling it is a large
+			 * speedup for a small loss in thin/fast-mover tracking. */
+			{
+				std::vector<float> pgh, gh;
+				int hw = 0, hh = 0;
+				nr3d::downsample2(prev_gray_, w, h, pgh, hw, hh);
+				nr3d::downsample2(gray, w, h, gh, hw, hh);
+				std::vector<float> uh, vh;
+				nr3d::denseFlowLK(pgh, gh, hw, hh, uh, vh);
+				/* Upscale flow to full res; double the magnitude since one
+				 * half-res pixel spans two full-res pixels. */
+				u.assign((size_t)n, 0.f);
+				vv.assign((size_t)n, 0.f);
+				const float sxh = (float)hw / (float)w; /* ~0.5 */
+				const float syh = (float)hh / (float)h;
+				for (int y = 0; y < h; ++y)
+					for (int x = 0; x < w; ++x) {
+						const size_t i = (size_t)y * w + x;
+						u[i] = 2.f * nr3d::bilinear(uh, hw, hh,
+									    x * sxh, y * syh);
+						vv[i] = 2.f * nr3d::bilinear(vh, hw, hh,
+									     x * sxh, y * syh);
+					}
+			}
 			flow_ms_ = std::chrono::duration<double, std::milli>(
 				std::chrono::steady_clock::now() - _tflow)
 					   .count();
