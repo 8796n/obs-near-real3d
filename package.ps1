@@ -17,7 +17,7 @@
 # in CI. Usage:  .\package.ps1 -Version 0.3.1            # full
 #                .\package.ps1 -Version 0.3.1 -Variant lite
 param(
-  [string]$Version = "0.4.1-dev",
+  [string]$Version = "0.5.0-dev",
   [ValidateSet("full", "lite")][string]$Variant = "full"
 )
 $ErrorActionPreference = "Stop"

@@ -87,18 +87,17 @@ float4 PSStereoSBS(VertData v_in) : TARGET
 	float d = depth_at(euv);
 	// Signed depth deviation from the screen plane; + = nearer than screen.
 	float e = d - convergence;
-	// Non-linear parallax grading. Blend the linear deviation toward an odd
-	// tanh S-curve: steeper through the mid-range, rounded as it approaches the
-	// near/far extremes. This buys an equivalent mid-scene depth at a lower peak
-	// disparity than the linear map, so the nearest-silhouette disocclusion
-	// stretch (DIBR rubber-sheet, which grows with disparity) builds up slower.
-	// Monotonic and zero at e=0, so depth ordering and the zero-parallax
-	// convergence plane are both preserved. d,convergence in [0,1] => e in
-	// [-1,1], the exact domain tanh(K*e)/tanh(K) maps back onto [-1,1], so the
-	// disparity bound is unchanged. grading=0 reproduces the linear map.
+	// Non-linear parallax grading. Normalise by the signed distance from the
+	// convergence plane to that side's depth endpoint, apply an odd tanh S-curve,
+	// then scale back. This makes the mid-range steeper while preserving the
+	// actual far/near endpoint disparities for any convergence value, so stronger
+	// mid-scene depth does not silently raise the peak silhouette stretch.
 	if (grading > 0.0) {
 		float K = 2.2;                          // S-curve sharpness
-		float curved = tanh(K * e) / tanh(K);   // [-1,1] -> [-1,1], endpoints kept
+		float span = (e >= 0.0) ? (1.0 - convergence) : convergence;
+		span = max(span, 1e-4);
+		float x = clamp(e / span, -1.0, 1.0);
+		float curved = (tanh(K * x) / tanh(K)) * span;
 		e = lerp(e, curved, grading);
 	}
 	float disp = strength * e;                      // + for nearer than screen
