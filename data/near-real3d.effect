@@ -18,6 +18,7 @@ uniform texture2d depth_tex;    // depth map (Phase 2), R = nearness in [0,1]
 
 uniform float strength;         // max disparity as fraction of eye width
 uniform float convergence;      // zero-parallax plane in [0,1]
+uniform float grading;          // 0 = linear disparity, 1 = full tanh S-curve
 uniform float swap_sign;        // +1 or -1 to flip left/right
 uniform float use_depth_tex;    // 0 = procedural luminance depth, 1 = depth_tex
 uniform float show_depth;       // debug: 1 = output the depth map as grayscale
@@ -84,7 +85,23 @@ float4 PSStereoSBS(VertData v_in) : TARGET
 	}
 
 	float d = depth_at(euv);
-	float disp = strength * (d - convergence);      // + for nearer than screen
+	// Signed depth deviation from the screen plane; + = nearer than screen.
+	float e = d - convergence;
+	// Non-linear parallax grading. Blend the linear deviation toward an odd
+	// tanh S-curve: steeper through the mid-range, rounded as it approaches the
+	// near/far extremes. This buys an equivalent mid-scene depth at a lower peak
+	// disparity than the linear map, so the nearest-silhouette disocclusion
+	// stretch (DIBR rubber-sheet, which grows with disparity) builds up slower.
+	// Monotonic and zero at e=0, so depth ordering and the zero-parallax
+	// convergence plane are both preserved. d,convergence in [0,1] => e in
+	// [-1,1], the exact domain tanh(K*e)/tanh(K) maps back onto [-1,1], so the
+	// disparity bound is unchanged. grading=0 reproduces the linear map.
+	if (grading > 0.0) {
+		float K = 2.2;                          // S-curve sharpness
+		float curved = tanh(K * e) / tanh(K);   // [-1,1] -> [-1,1], endpoints kept
+		e = lerp(e, curved, grading);
+	}
+	float disp = strength * e;                      // + for nearer than screen
 	// left and right eyes shift in opposite directions
 	float sgn = lerp(-swap_sign, swap_sign, eyeRight);
 	float2 suv = float2(euv.x + sgn * disp * 0.5, euv.y);

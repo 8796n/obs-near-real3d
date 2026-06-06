@@ -572,6 +572,14 @@ public:
 				      (int)prev_gray_.size() == n;
 		if (!do_blend) {
 			out = cur;
+			/* No flow-compensated history this frame (scene cut / first frame /
+			 * stabilisation off): there is no instability measure, so let the
+			 * scene-confidence recover toward 1 (trust the depth) rather than
+			 * hold a stale low value; a cut snaps it fully. Confidence drives
+			 * the optional auto 3D-suppression downstream and only moves while
+			 * temporal stabilisation is on. */
+			confidence_ = cut ? 1.f
+					  : CONF_EMA * confidence_ + (1.f - CONF_EMA);
 		} else {
 			std::vector<float> u, vv;
 			nr3d::denseFlowLK(prev_gray_, gray, w, h, u, vv);
@@ -618,12 +626,24 @@ public:
 						 : (strength > 1.f ? 1.f : strength);
 			const float alpha = 1.f - 0.92f * s;
 			out.resize((size_t)n);
+			/* Accumulate the mean flow-compensated depth residual over the
+			 * whole frame -> a scene-confidence scalar. When the depth is
+			 * temporally consistent (a structured scene the model reads well)
+			 * the warped history matches the fresh depth and the mean residual
+			 * is small; when the model fabricates depth from luminance on a
+			 * low-structure scene (sky / starfield / fog) or under global camera
+			 * shake, consecutive depths disagree everywhere and the mean is
+			 * large. A local mover keeps the MEAN low (only its pixels spike),
+			 * so this does not over-suppress a structured scene with motion. */
+			double dres_sum = 0.0;
 			for (int i = 0; i < n; ++i) {
+				const float dres =
+					std::fabs(cur[i] - warped[i]); /* depth resid 0..1 */
+				dres_sum += dres;
 				if (!reactive.empty() && reactive[i]) {
 					out[i] = cur[i];
 					continue;
 				}
-				float dres = std::fabs(cur[i] - warped[i]);  /* depth resid 0..1 */
 				float dboost = (dres - GHOST_LO) * GHOST_INV_SPAN;
 				float ires = std::fabs(gray[i] - wgray[i]);  /* image resid 0..255 */
 				float iboost = (ires - IMG_LO) * IMG_INV_SPAN;
@@ -632,6 +652,14 @@ public:
 				float a = alpha + (1.f - alpha) * boost;
 				out[i] = a * cur[i] + (1.f - a) * (*history)[i];
 			}
+			/* Map the mean residual to confidence in [CONF_FLOOR,1] and LPF it
+			 * over time so the downstream 3D-strength can't pump frame to frame. */
+			const float mean_dres = (float)(dres_sum / n);
+			float ct = (mean_dres - CONF_RES_LO) /
+				   (CONF_RES_HI - CONF_RES_LO);
+			ct = ct < 0.f ? 0.f : (ct > 1.f ? 1.f : ct);
+			const float craw = 1.f - (1.f - CONF_FLOOR) * ct;
+			confidence_ = CONF_EMA * confidence_ + (1.f - CONF_EMA) * craw;
 		}
 
 		prev_gray_ = gray;
@@ -647,6 +675,12 @@ public:
 			nr3d::edgeSoftenDepth(out, w, h, smooth_sigma, EDGE_LO,
 					      EDGE_HI);
 	}
+
+	/* Scene confidence in [CONF_FLOOR,1] from the mean depth residual (1 =
+	 * trustworthy/structured, low = fabricated/unstable). Drives the optional
+	 * auto 3D-suppression in the renderer. Updated each process() call, read by
+	 * the worker right after. Only moves while temporal stabilisation is on. */
+	float confidence() const { return confidence_; }
 
 private:
 	static constexpr float RANGE_EMA = 0.90f;       /* normalisation scale LPF */
@@ -673,6 +707,15 @@ private:
 	 * EDGE_LO stays crisp, at/above EDGE_HI is fully feathered, smoothstep between */
 	static constexpr float EDGE_LO = 0.05f;
 	static constexpr float EDGE_HI = 0.25f;
+	/* auto 3D-suppression confidence: mean flow-compensated depth residual at or
+	 * below CONF_RES_LO = full confidence (1.0); at or above CONF_RES_HI = max
+	 * suppression (floored at CONF_FLOOR so the 3D eases off, never hard-flips to
+	 * 2D). CONF_EMA low-passes it at the worker (depth) cadence. */
+	static constexpr float CONF_RES_LO = 0.04f;
+	static constexpr float CONF_RES_HI = 0.14f;
+	static constexpr float CONF_FLOOR = 0.20f;
+	static constexpr float CONF_EMA = 0.85f;
+	float confidence_ = 1.f;
 	bool has_prev_ = false;
 	bool have_range_ = false;
 	float mn_ema_ = 0.f, mx_ema_ = 0.f;
