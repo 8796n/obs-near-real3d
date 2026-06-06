@@ -19,9 +19,11 @@ uniform texture2d depth_tex;    // depth map (Phase 2), R = nearness in [0,1]
 uniform float strength;         // max disparity as fraction of eye width
 uniform float convergence;      // zero-parallax plane in [0,1]
 uniform float grading;          // 0 = linear disparity, 1 = full tanh S-curve
+uniform float silhouette;       // directional silhouette protection, 0 = off
 uniform float swap_sign;        // +1 or -1 to flip left/right
 uniform float use_depth_tex;    // 0 = procedural luminance depth, 1 = depth_tex
 uniform float show_depth;       // debug: 1 = output the depth map as grayscale
+uniform float2 depth_texel;     // 1 / depth map size, for edge-aware disparity limits
 uniform float2 eye_fit;         // source sub-rect in each eye; (1,1) = stretch-fill
 uniform float dither;           // output dither amount (mpv-grain scale); 0 = off
 uniform float2 out_size;        // SBS output resolution in px, for the dither seed
@@ -103,6 +105,22 @@ float4 PSStereoSBS(VertData v_in) : TARGET
 	float disp = strength * e;                      // + for nearer than screen
 	// left and right eyes shift in opposite directions
 	float sgn = lerp(-swap_sign, swap_sign, eyeRight);
+	// Directional silhouette protection: the DIBR tear is horizontal, so only
+	// look along the actual source-sampling direction for this eye/pixel. Strong
+	// depth jumps there mean the warp is about to cross a foreground/background
+	// boundary; locally reduce disparity instead of globally blurring the depth.
+	if (silhouette > 0.0 && abs(disp) > 1e-6) {
+		float warp = sgn * disp * 0.5;
+		float dir = (warp >= 0.0) ? 1.0 : -1.0;
+		float2 ox = float2(depth_texel.x * dir, 0.0);
+		float d1 = depth_at(euv + ox);
+		float d2 = depth_at(euv + ox * 2.0);
+		float dt = depth_at(float2(euv.x + warp, euv.y));
+		float g = max(max(abs(d - d1), abs(d1 - d2)),
+			      abs(d - dt) * 0.65);
+		float m = smoothstep(0.035, 0.18, g) * saturate(silhouette);
+		disp *= lerp(1.0, 0.45, m);
+	}
 	float2 suv = float2(euv.x + sgn * disp * 0.5, euv.y);
 	float4 col = image.Sample(linClamp, suv);
 
