@@ -27,6 +27,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -509,6 +510,8 @@ public:
 		     float smooth_sigma)
 	{
 		const int n = w * h;
+		flow_ms_ = 0.0; /* perf split (debug): set below when each stage runs */
+		edge_ms_ = 0.0;
 
 		/* grayscale (Rec.601 luma, 0..255) */
 		std::vector<float> gray((size_t)n);
@@ -582,7 +585,11 @@ public:
 					  : CONF_EMA * confidence_ + (1.f - CONF_EMA);
 		} else {
 			std::vector<float> u, vv;
+			const auto _tflow = std::chrono::steady_clock::now();
 			nr3d::denseFlowLK(prev_gray_, gray, w, h, u, vv);
+			flow_ms_ = std::chrono::duration<double, std::milli>(
+				std::chrono::steady_clock::now() - _tflow)
+					   .count();
 
 			/* backward-warp prev depth AND prev gray into current alignment:
 			 * warped(X) = prev(X - flow). The flow-compensated gray residual
@@ -671,9 +678,14 @@ public:
 		 * localised: only the depth discontinuities are feathered, so flat
 		 * regions keep their full depth detail (a global blur rounded off the
 		 * whole 3D and bled the foreground outward). */
-		if (smooth_sigma > 0.f && (int)out.size() == n)
+		if (smooth_sigma > 0.f && (int)out.size() == n) {
+			const auto _tedge = std::chrono::steady_clock::now();
 			nr3d::edgeSoftenDepth(out, w, h, smooth_sigma, EDGE_LO,
 					      EDGE_HI);
+			edge_ms_ = std::chrono::duration<double, std::milli>(
+				std::chrono::steady_clock::now() - _tedge)
+					   .count();
+		}
 	}
 
 	/* Scene confidence in [CONF_FLOOR,1] from the mean depth residual (1 =
@@ -681,6 +693,11 @@ public:
 	 * auto 3D-suppression in the renderer. Updated each process() call, read by
 	 * the worker right after. Only moves while temporal stabilisation is on. */
 	float confidence() const { return confidence_; }
+
+	/* Per-call wall-clock of the two heaviest stages (ms) for the debug perf
+	 * log; 0 when the stage didn't run this frame. Worker-thread only. */
+	double flow_ms() const { return flow_ms_; }
+	double edge_ms() const { return edge_ms_; }
 
 private:
 	static constexpr float RANGE_EMA = 0.90f;       /* normalisation scale LPF */
@@ -716,6 +733,7 @@ private:
 	static constexpr float CONF_FLOOR = 0.20f;
 	static constexpr float CONF_EMA = 0.85f;
 	float confidence_ = 1.f;
+	double flow_ms_ = 0.0, edge_ms_ = 0.0; /* debug perf split (ms) */
 	bool has_prev_ = false;
 	bool have_range_ = false;
 	float mn_ema_ = 0.f, mx_ema_ = 0.f;

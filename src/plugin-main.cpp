@@ -243,6 +243,7 @@ struct real3d_filter {
 	bool logged_first_depth = false;
 	uint32_t last_logged_depth_gen = 0xFFFFFFFFu; /* debug: log first depth per gen once */
 	uint64_t last_submit_ns = 0;
+	uint64_t last_perf_log_ns = 0; /* debug: throttle for the stabiliser perf split (worker) */
 
 	/* static-frame skip: when the downscaled input barely changes we reuse
 	 * the depth already cached instead of re-running ONNX */
@@ -523,6 +524,7 @@ static void worker_fn(real3d_filter *f)
 		/* raw ONNX depth -> normalise + flow-guided temporal stabilise */
 		const uint64_t run_start = os_gettime_ns();
 		if (f->ort.Run(local_in.data(), raw)) {
+			const uint64_t run_done = os_gettime_ns();
 			f->flow.process(
 				local_in.data(),
 				f->ort.width(), f->ort.height(), raw, stab,
@@ -545,6 +547,25 @@ static void worker_fn(real3d_filter *f)
 				f->depth_ready = true;
 			}
 			f->ort_live.store(true, std::memory_order_relaxed);
+			/* Debug perf split: where a depth frame's time actually goes
+			 * (ONNX Run vs the flow-guided stabiliser, broken into dense flow /
+			 * edge-soften / the rest). Gated on the depth-match overlay toggle
+			 * and throttled to ~1 s so a measuring session isn't flooded. Worker
+			 * thread only, so last_perf_log_ns needs no lock. */
+			if (f->debug_overlay.load(std::memory_order_relaxed) &&
+			    done - f->last_perf_log_ns > 1000000000ULL) {
+				f->last_perf_log_ns = done;
+				const double onnx_ms = (double)(run_done - run_start) / 1e6;
+				const double proc_ms = (double)(done - run_done) / 1e6;
+				const double flow_ms = f->flow.flow_ms();
+				const double edge_ms = f->flow.edge_ms();
+				blog(LOG_INFO,
+				     "[near-real3d] stab perf: onnx %.1f | flow %.1f | "
+				     "edge %.1f | other %.1f | total %.1f ms (%dx%d)",
+				     onnx_ms, flow_ms, edge_ms,
+				     proc_ms - flow_ms - edge_ms, onnx_ms + proc_ms,
+				     f->ort.width(), f->ort.height());
+			}
 		} else if (f->ort_live.exchange(false, std::memory_order_relaxed)) {
 			/* runtime failure (vs the one-time Init failure): drop to the
 			 * luminance-depth fallback instead of freezing the last depth. */
