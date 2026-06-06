@@ -35,7 +35,7 @@
  * CMake (-DPLUGIN_VERSION, e.g. v0.3.1 for a tag build); the fallback below is
  * only used for IDE/standalone builds that don't define it. */
 #ifndef REAL3D_VERSION
-#define REAL3D_VERSION "0.4.1-dev"
+#define REAL3D_VERSION "0.5.0-dev"
 #endif
 #define REAL3D_BUILD_INFO \
 	("near Real 3D " REAL3D_VERSION "  (built " __DATE__ " " __TIME__ ")")
@@ -1610,7 +1610,8 @@ static void real3d_video_render(void *data, gs_effect_t *)
 		 * time-smoothed in the stabiliser; this is just the render-rate glue. */
 		{
 			const float target =
-				f->auto_suppress.load(std::memory_order_relaxed)
+				(f->auto_suppress.load(std::memory_order_relaxed) &&
+				 f->ort.temporal.load(std::memory_order_relaxed))
 					? f->scene_conf
 					: 1.0f;
 			const float step = CONF_RAMP_PER_SEC * dt;

@@ -7,7 +7,7 @@
 ; install dir are identical -- only the bundled model differs).
 
 #ifndef AppVersion
-  #define AppVersion "0.4.1-dev"
+  #define AppVersion "0.5.0-dev"
 #endif
 #ifdef Lite
   #define VariantSuffix "-lite"
