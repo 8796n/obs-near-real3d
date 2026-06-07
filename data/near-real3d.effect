@@ -20,6 +20,7 @@ uniform float strength;         // max disparity as fraction of eye width
 uniform float convergence;      // zero-parallax plane in [0,1]
 uniform float grading;          // 0 = linear disparity, 1 = full tanh S-curve
 uniform float silhouette;       // directional silhouette protection, 0 = off
+uniform float flat_protect;     // flat-region disparity damping, 0 = off
 uniform float swap_sign;        // +1 or -1 to flip left/right
 uniform float use_depth_tex;    // 0 = procedural luminance depth, 1 = depth_tex
 uniform float show_depth;       // debug: 1 = output the depth map as grayscale
@@ -60,6 +61,13 @@ float depth_at(float2 uv)
 	if (use_depth_tex > 0.5)
 		return depth_tex.Sample(linClamp, uv).r;
 	float3 c = image.Sample(linClamp, uv).rgb;     // luminance stand-in
+	return dot(c, float3(0.299, 0.587, 0.114));
+}
+
+// Source-image luminance (linear light) for the flat-region detector below.
+float src_luma(float2 uv)
+{
+	float3 c = image.Sample(linClamp, uv).rgb;
 	return dot(c, float3(0.299, 0.587, 0.114));
 }
 
@@ -120,6 +128,26 @@ float4 PSStereoSBS(VertData v_in) : TARGET
 			      abs(d - dt) * 0.65);
 		float m = smoothstep(0.035, 0.18, g) * saturate(silhouette);
 		disp *= lerp(1.0, 0.45, m);
+	}
+	// Flat-region disparity damping: a monocular model only fabricates depth for
+	// textureless areas (black/white letterbox bars, flat UI panels, smooth sky),
+	// and warping them shears the straight bar/UI edges that run through them.
+	// Where the local source image has little texture, damp the disparity toward
+	// zero so those regions sit at the screen plane and stay straight, while
+	// textured content keeps full 3D. Image-based, so it catches flat regions
+	// anywhere in the frame (interior bars/margins), not just the outer border.
+	if (flat_protect > 0.0 && abs(disp) > 1e-6) {
+		float FO = 0.004;   // sample offset in eye-uv (~a few source px)
+		float l0 = src_luma(euv);
+		float lo = l0, hi = l0;
+		float l;
+		l = src_luma(euv + float2(FO, 0.0)); lo = min(lo, l); hi = max(hi, l);
+		l = src_luma(euv - float2(FO, 0.0)); lo = min(lo, l); hi = max(hi, l);
+		l = src_luma(euv + float2(0.0, FO)); lo = min(lo, l); hi = max(hi, l);
+		l = src_luma(euv - float2(0.0, FO)); lo = min(lo, l); hi = max(hi, l);
+		float contrast = hi - lo;            // 0 = perfectly flat
+		float flatness = 1.0 - smoothstep(0.015, 0.06, contrast); // 1=flat, 0=textured
+		disp *= 1.0 - flatness * saturate(flat_protect);          // -> 0 where flat
 	}
 	float2 suv = float2(euv.x + sgn * disp * 0.5, euv.y);
 	float4 col = image.Sample(linClamp, suv);
