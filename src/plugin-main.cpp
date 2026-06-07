@@ -159,7 +159,7 @@ struct real3d_filter {
 	gs_effect_t *effect = nullptr;
 	gs_eparam_t *p_image = nullptr, *p_strength = nullptr,
 		    *p_conv = nullptr, *p_grading = nullptr,
-		    *p_silhouette = nullptr, *p_swap = nullptr,
+		    *p_silhouette = nullptr, *p_flat = nullptr, *p_swap = nullptr,
 		    *p_usedepth = nullptr, *p_depthtex = nullptr,
 		    *p_showdepth = nullptr, *p_depthtexel = nullptr,
 		    *p_eyefit = nullptr,
@@ -189,6 +189,7 @@ struct real3d_filter {
 	std::atomic<float> frac{0.018f}, convergence{0.5f}, swap_sign{1.0f};
 	std::atomic<float> grading{0.0f}; /* 0 = linear disparity; 1 = full tanh S-curve */
 	std::atomic<float> silhouette{0.35f}; /* directional disparity clamp at depth edges */
+	std::atomic<float> flat_protect{0.0f}; /* damp disparity in flat (UI/bar/sky) regions */
 	std::atomic<bool> full_sbs{true};
 	std::atomic<int> sbs_size{0};   /* 0 = match source, 1 = 1080p (1920x1080/eye) */
 	std::atomic<bool> eye_letterbox{false}; /* aspect-fit source into each eye (vs stretch) */
@@ -592,6 +593,7 @@ static void real3d_update(void *data, obs_data_t *s)
 	f->convergence.store((float)obs_data_get_double(s, "convergence"), rel);
 	f->grading.store((float)obs_data_get_double(s, "grading"), rel);
 	f->silhouette.store((float)obs_data_get_double(s, "silhouette"), rel);
+	f->flat_protect.store((float)obs_data_get_double(s, "flat_protect"), rel);
 	f->swap_sign.store(obs_data_get_bool(s, "swap") ? -1.0f : 1.0f, rel);
 	bool prev = f->full_sbs.load(rel);
 	bool full_sbs = obs_data_get_bool(s, "full_sbs");
@@ -675,6 +677,7 @@ static void *real3d_create(obs_data_t *settings, obs_source_t *context)
 		f->p_conv = gs_effect_get_param_by_name(f->effect, "convergence");
 		f->p_grading = gs_effect_get_param_by_name(f->effect, "grading");
 		f->p_silhouette = gs_effect_get_param_by_name(f->effect, "silhouette");
+		f->p_flat = gs_effect_get_param_by_name(f->effect, "flat_protect");
 		f->p_swap = gs_effect_get_param_by_name(f->effect, "swap_sign");
 		f->p_usedepth = gs_effect_get_param_by_name(f->effect, "use_depth_tex");
 		f->p_depthtex = gs_effect_get_param_by_name(f->effect, "depth_tex");
@@ -836,6 +839,10 @@ static obs_properties_t *real3d_properties(void *data)
 					    obs_module_text("silhouette"), 0.0,
 					    1.0, 0.05);
 	obs_property_set_long_description(q, obs_module_text("silhouette.desc"));
+	q = obs_properties_add_float_slider(g3d, "flat_protect",
+					    obs_module_text("flatprotect"), 0.0,
+					    1.0, 0.05);
+	obs_property_set_long_description(q, obs_module_text("flatprotect.desc"));
 	q = obs_properties_add_bool(g3d, "swap", obs_module_text("swap"));
 	obs_property_set_long_description(q, obs_module_text("swap.desc"));
 	q = obs_properties_add_bool(g3d, "full_sbs", obs_module_text("fullsbs"));
@@ -936,6 +943,7 @@ static void real3d_defaults(obs_data_t *s)
 	obs_data_set_default_double(s, "convergence", 0.5);
 	obs_data_set_default_double(s, "grading", 0.0);
 	obs_data_set_default_double(s, "silhouette", 0.35);
+	obs_data_set_default_double(s, "flat_protect", 0.0);
 	obs_data_set_default_bool(s, "swap", false);
 	obs_data_set_default_bool(s, "full_sbs", true);
 	obs_data_set_default_int(s, "sbs_size", 0);
@@ -1679,6 +1687,7 @@ static void real3d_video_render(void *data, gs_effect_t *)
 	gs_effect_set_float(f->p_conv, f->convergence.load(rel));
 	gs_effect_set_float(f->p_grading, f->grading.load(rel));
 	gs_effect_set_float(f->p_silhouette, f->silhouette.load(rel));
+	gs_effect_set_float(f->p_flat, f->flat_protect.load(rel));
 	gs_effect_set_float(f->p_swap, f->swap_sign.load(rel));
 	gs_effect_set_float(f->p_usedepth,
 			    (f->ort_ok && f->ort_live.load(rel)) ? 1.0f : 0.0f);
